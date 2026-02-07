@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.pyd
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+*.egg
+.venv/
+venv/
+.env
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Stipple tool outputs
+output_models/
+_stencil_local_*.step
+_stencil_local_*_out.step
+test_*.step
+test_*.stl
+*_stippled*.step
+*_stippled*.stl
