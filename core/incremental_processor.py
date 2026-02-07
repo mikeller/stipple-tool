@@ -42,19 +42,18 @@ class IncrementalStippleProcessor:
             step_file: Path to input STEP file
             output_path: Path to output STEP file
             target_color: Color hex code to stipple
-            sphere_radius: Radius of stipple dimples
-            sphere_depth: Depth to push spheres
+            sphere_radius: Radius of stipple dimples (sphere_depth is derived from this)
+            sphere_depth: Deprecated - depth is calculated from sphere_radius internally
             num_spheres: Total number of stipples
             batch_size: How many spheres to apply per batch
             target_faces: List of face indices to stipple
             size_variation: If True, vary sphere radius from 0.5x to 1.5x
             progress_callback: Callback(current, total)
+            batch_progress_callback: Callback for batch progress
             status_callback: Callback(message)
-            sphere_depth: Depth to push spheres
-            num_spheres: Total number of stipples
-            batch_size: How many spheres to apply per batch
-            progress_callback: Callback(current, total)
-            status_callback: Callback(message)
+            cancel_callback: Callback to check if cancellation requested
+            status_prefix: Prefix for status messages
+            return_stats: If True, return statistics dict
             
         Returns:
             Output file path on success, None on failure

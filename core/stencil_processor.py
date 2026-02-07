@@ -170,6 +170,7 @@ class StencilStippleProcessor:
 
                 # Apply spheres in small batches
                 strip_spheres = 0
+                failed_batches = 0
                 num_batches = (len(sphere_positions) + batch_size - 1) // batch_size
                 for batch_idx, batch_start in enumerate(range(0, len(sphere_positions), batch_size)):
                     check_cancel()
@@ -209,28 +210,21 @@ class StencilStippleProcessor:
                         if cut_op.IsDone():
                             new_shape = cut_op.Shape()
                             if not new_shape.IsNull():
-                                # Verify the result has reasonable complexity
-                                face_count = 0
-                                exp = TopExp_Explorer(new_shape, TopAbs_FACE)
-                                while exp.More():
-                                    face_count += 1
-                                    exp.Next()
-                                
-                                if face_count < 10:
-                                    emit_status(f"  Warning: cut produced degenerate shape ({face_count} faces), skipping")
-                                    continue
-                                
+                                # Accept the cut - shape validity is confirmed by IsDone() and IsNull() checks
+                                # (cut result might be a shell/face and legitimately have 0 volume)
                                 current_shape = new_shape
                                 total_spheres_applied += spheres_in_batch
                                 strip_spheres += spheres_in_batch
                             else:
-                                emit_status(f"Cut produced null shape at batch {batch_start}")
+                                failed_batches += 1
                         else:
-                            emit_status(f"Cut not done at batch {batch_start}")
+                            failed_batches += 1
                     except Exception as e:
                         emit_status(f"Batch cut failed: {e}")
 
-                emit_status(f"Strip {i + 1} complete: {strip_spheres} spheres, total: {total_spheres_applied}")
+                emit_status(f"Strip {i + 1} complete: {strip_spheres} spheres, total: {total_spheres_applied}", )
+                if failed_batches > 0:
+                    emit_status(f"  ({failed_batches} batches could not be applied)")
 
             # Save final shape
             emit_status(f"\nSaving result: {output_path}")

@@ -8,8 +8,15 @@ from OCP.gp import gp_Pnt
 from OCP.TopoDS import TopoDS_Compound, TopoDS_Builder
 
 loader = STEPLoader()
-loader.load('crosman_1377_grip_base_left.step')
+if not loader.load('crosman_1377_grip_base_left.step'):
+    print('Error: Failed to load STEP file')
+    exit(1)
+
 shape = loader.shape
+if shape is None:
+    print('Error: Shape is None after loading')
+    exit(1)
+
 print(f'Loaded shape, is null: {shape.IsNull()}')
 
 # Try a single sphere cut at origin
