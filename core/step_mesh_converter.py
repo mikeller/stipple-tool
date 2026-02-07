@@ -74,7 +74,8 @@ class STEPMeshConverter:
                     # This is the correct way to get triangulation from a meshed shape
                     from OCP.Handle import Handle_Poly_Triangulation
                     triangulation = face.Triangulation(location)
-                except:
+                except Exception:
+                    # Some faces may legitimately lack triangulation
                     pass
 
                 if triangulation is not None:
@@ -82,10 +83,17 @@ class STEPMeshConverter:
                     face_triangles = triangulation.Triangles()
                     face_nodes = triangulation.Nodes()
 
+                    # Precompute transformation from location, if any
+                    trsf = None
+                    if not location.IsIdentity():
+                        trsf = location.Transformation()
+
                     # Add vertices for this face
                     face_vertex_offset = len(vertices)
                     for i in range(1, face_nodes.Length() + 1):
                         node = face_nodes.Value(i)
+                        if trsf is not None:
+                            node = node.Transformed(trsf)
                         vertices.append([node.X(), node.Y(), node.Z()])
 
                     # Add faces

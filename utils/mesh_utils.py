@@ -21,7 +21,7 @@ class MeshUtils:
         """
         try:
             return face.Area()
-        except:
+        except Exception:
             return 0.0
     
     @staticmethod
@@ -44,7 +44,7 @@ class MeshUtils:
             normal = surface.Normal(u, v)
             
             return (normal.X, normal.Y, normal.Z)
-        except:
+        except Exception:
             return (0, 0, 1)  # Default to Z normal
     
     @staticmethod
@@ -64,7 +64,7 @@ class MeshUtils:
             # This is a simplified projection
             # A full implementation would use surface projection algorithms
             return point
-        except:
+        except Exception:
             return point
     
     @staticmethod
@@ -93,7 +93,7 @@ class MeshUtils:
                 max_z = max(max_z, bbox.zmax)
             
             return ((min_x, min_y, min_z), (max_x, max_y, max_z))
-        except:
+        except Exception:
             return ((0, 0, 0), (1, 1, 1))
     
     @staticmethod

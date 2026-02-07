@@ -256,7 +256,7 @@ class IncrementalStippleProcessor:
                                     healer.Init(result_shape)
                                     healer.Perform()
                                     current_shape = healer.Shape()
-                                except:
+                                except Exception:
                                     # If healing fails, just use the raw result
                                     current_shape = result_shape
                             else:
@@ -364,14 +364,14 @@ class IncrementalStippleProcessor:
                 dist_calc.LoadS2(face)
                 dist_calc.Perform()
                 
-                # Use slightly negative threshold to only reject actual intersections
-                # (positive distance = separated, negative = overlap)
-                if dist_calc.IsDone() and dist_calc.Value() < -0.01:
-                    # Sphere significantly intersects this non-target face
+                # Use small non-negative tolerance to detect intersections
+                # (distance ~ 0 = touching/overlap, positive distance = separated)
+                if dist_calc.IsDone() and dist_calc.Value() <= 1e-6:
+                    # Sphere intersects or touches this non-target face
                     return True
             
             return False
-        except:
+        except Exception:
             # If distance calculation fails, conservatively skip the sphere
             return True
 
@@ -472,7 +472,7 @@ class IncrementalStippleProcessor:
                                 point.Y() + normal_vec.Y() * offset_dist,
                                 point.Z() + normal_vec.Z() * offset_dist
                             )
-                        except:
+                        except Exception:
                             # If normal fails, just use the point on surface
                             offset_point = point
                         

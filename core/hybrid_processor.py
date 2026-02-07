@@ -156,18 +156,6 @@ class HybridSTEPMeshProcessor:
             import traceback
             traceback.print_exc()
             return None
-            print("\n" + "=" * 60)
-            print("✓ WORKFLOW COMPLETE")
-            print("=" * 60)
-
-            return True, f"Successfully processed and saved to {output_file}"
-
-        except Exception as e:
-            import traceback
-
-            error_msg = f"Error in hybrid processing: {str(e)}\n{traceback.format_exc()}"
-            print(f"\n✗ ERROR: {error_msg}")
-            return False, error_msg
 
     def _step_to_mesh_with_colors(
         self, step_model: Dict, color_groups: Dict[str, List[int]]
@@ -226,6 +214,10 @@ class HybridSTEPMeshProcessor:
             
             # Calculate how many mesh faces each color should get
             total_step_faces = len(step_faces)
+            if total_step_faces == 0:
+                print("     Warning: No STEP faces found, cannot map colors")
+                return mesh, {}
+            
             mesh_face_idx = 0
             
             for color, step_face_indices in sorted(color_groups.items()):
@@ -285,13 +277,10 @@ class HybridSTEPMeshProcessor:
             print(f"   Mapped {len(target_indices)} mesh faces to color {target_color}")
             return target_indices
 
-        # Fallback: If no exact match, try to estimate based on proportions
-        print(f"   ⚠ No exact color mapping found, using fallback strategy...")
+        # Fallback: If no exact match, return empty list
+        print(f"   ⚠ No exact color mapping found for color {target_color}")
         print(f"     Total mesh faces: {total_faces}")
         print(f"     Face color map entries: {len(face_color_map)}")
-
-        # Map whatever we have
-        if face_color_map:
-            return list(range(min(len(face_color_map), total_faces)))
+        print(f"     Warning: Cannot stipple faces without proper color mapping")
 
         return []

@@ -619,8 +619,11 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Cancelling...")
             self.processing_thread.wait(5000)
             if self.processing_thread.isRunning():
-                self.processing_thread.terminate()
-            self.status_label.setText("Cancelled")
+                # Thread did not stop gracefully - warn user but don't terminate
+                # (terminate() is unsafe and can corrupt state)
+                self.status_label.setText("Warning: Processing still running in background")
+            else:
+                self.status_label.setText("Cancelled")
             self.progress_bar.setValue(0)
     
     def on_processing_finished(self, success: bool, message: str):

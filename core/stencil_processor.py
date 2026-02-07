@@ -291,7 +291,7 @@ class StencilStippleProcessor:
                             normal.Normalize()
                         else:
                             normal = gp_Vec(0, 0, 1)
-                    except:
+                    except Exception:
                         normal = gp_Vec(0, 0, 1)
 
                     # Offset point inward by sphere depth

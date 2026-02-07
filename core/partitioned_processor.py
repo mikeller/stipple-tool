@@ -616,7 +616,8 @@ class PartitionedStippleProcessor:
         for temp_file in temp_files:
             try:
                 Path(temp_file).unlink()
-            except:
+            except Exception:
+                # Best-effort cleanup: ignore failures deleting temporary files
                 pass
 
         return stippled
