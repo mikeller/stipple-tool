@@ -1,7 +1,0 @@
-cadquery-ocp==7.7.2
-numpy==1.26.4
-PyQt6==6.7.1
-PyQt6-Qt6==6.7.3
-PyQt6_sip==13.10.2
-trimesh==4.4.1
-scipy==1.13.1
