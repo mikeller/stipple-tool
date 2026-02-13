@@ -14,6 +14,169 @@ class STEPMeshConverter:
     """Converts STEP shapes to mesh format using CadQuery/OCP."""
 
     @staticmethod
+    def _extract_triangulation_nodes(triangulation):
+        nodes_attr = getattr(triangulation, "Nodes", None)
+        if nodes_attr is not None:
+            return nodes_attr() if callable(nodes_attr) else nodes_attr
+
+        if hasattr(triangulation, "NbNodes") and hasattr(triangulation, "Node"):
+            count = triangulation.NbNodes()
+            return [triangulation.Node(i) for i in range(1, count + 1)]
+
+        return None
+
+    @staticmethod
+    def _extract_triangulation_triangles(triangulation):
+        triangles_attr = getattr(triangulation, "Triangles", None)
+        if triangles_attr is not None:
+            return triangles_attr() if callable(triangles_attr) else triangles_attr
+
+        if hasattr(triangulation, "NbTriangles") and hasattr(triangulation, "Triangle"):
+            count = triangulation.NbTriangles()
+            return [triangulation.Triangle(i) for i in range(1, count + 1)]
+
+        return None
+
+    @staticmethod
+    def shape_to_mesh_with_face_map(
+        shape,
+        deflection: float = 0.1,
+    ) -> Optional[tuple[trimesh.Trimesh, list[int]]]:
+        """
+        Convert a CadQuery/OCP shape to a trimesh.Trimesh object and
+        return a mapping from mesh face index to STEP face index.
+
+        Args:
+            shape: OCP TopoDS_Shape object
+            deflection: Mesh deflection (lower = finer mesh)
+
+        Returns:
+            (trimesh.Trimesh, face_map) or None if conversion fails
+        """
+        if not HAS_OCP:
+            print("❌ cadquery-ocp libraries not available")
+            return None
+
+        try:
+            from OCP.BRep import BRep_Tool
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_FACE
+            from OCP.TopLoc import TopLoc_Location
+            from OCP.TopoDS import TopoDS
+        except ImportError as e:
+            print(f"❌ OCP import failed: {e}")
+            return None
+
+        try:
+            deflection = max(0.001, min(1.0, deflection))
+            print(f"Converting STEP shape to mesh (deflection={deflection})...")
+
+            mesh_maker = BRepMesh_IncrementalMesh(shape, float(deflection), False, 0.5)
+            mesh_maker.Perform()
+
+            if not mesh_maker.IsDone():
+                print("❌ Mesh creation failed")
+                return None
+
+            vertices = []
+            faces = []
+            face_map: list[int] = []
+
+            explorer = TopExp_Explorer(shape, TopAbs_FACE)
+            face_count = 0
+            triangulated_count = 0
+
+            while explorer.More():
+                face = TopoDS.Face_s(explorer.Current())
+
+                location = TopLoc_Location()
+                triangulation = None
+                try:
+                    triangulation = BRep_Tool.Triangulation_s(face, location)
+                except Exception:
+                    triangulation = None
+
+                if triangulation is not None:
+                    triangulated_count += 1
+                    face_triangles = STEPMeshConverter._extract_triangulation_triangles(
+                        triangulation
+                    )
+                    face_nodes = STEPMeshConverter._extract_triangulation_nodes(
+                        triangulation
+                    )
+
+                    if face_triangles is None or face_nodes is None:
+                        explorer.Next()
+                        face_count += 1
+                        continue
+
+                    trsf = None
+                    if not location.IsIdentity():
+                        trsf = location.Transformation()
+
+                    face_vertex_offset = len(vertices)
+                    if hasattr(face_nodes, "Length") and hasattr(face_nodes, "Value"):
+                        node_count = face_nodes.Length()
+                        node_get = face_nodes.Value
+                    else:
+                        node_count = len(face_nodes)
+                        node_get = lambda idx: face_nodes[idx - 1]
+
+                    for i in range(1, node_count + 1):
+                        node = node_get(i)
+                        if trsf is not None:
+                            node = node.Transformed(trsf)
+                        vertices.append([node.X(), node.Y(), node.Z()])
+
+                    if hasattr(face_triangles, "Length") and hasattr(face_triangles, "Value"):
+                        tri_count = face_triangles.Length()
+                        tri_get = face_triangles.Value
+                    else:
+                        tri_count = len(face_triangles)
+                        tri_get = lambda idx: face_triangles[idx - 1]
+
+                    for i in range(1, tri_count + 1):
+                        triangle = tri_get(i)
+                        if hasattr(triangle, "Value"):
+                            v1 = triangle.Value(1) - 1 + face_vertex_offset
+                            v2 = triangle.Value(2) - 1 + face_vertex_offset
+                            v3 = triangle.Value(3) - 1 + face_vertex_offset
+                        else:
+                            v1, v2, v3 = triangle.Get()
+                            v1 = v1 - 1 + face_vertex_offset
+                            v2 = v2 - 1 + face_vertex_offset
+                            v3 = v3 - 1 + face_vertex_offset
+                        faces.append([v1, v2, v3])
+                        face_map.append(face_count)
+
+                explorer.Next()
+                face_count += 1
+
+            print(
+                f"  Explored {face_count} faces, triangulated {triangulated_count}, "
+                f"extracted {len(faces)} triangles"
+            )
+
+            if not vertices or not faces:
+                print("❌ No mesh data extracted")
+                return None
+
+            mesh = trimesh.Trimesh(
+                vertices=np.array(vertices),
+                faces=np.array(faces),
+                process=False,
+            )
+
+            print(f"✓ Converted to mesh: {len(vertices)} vertices, {len(faces)} faces")
+            return mesh, face_map
+
+        except Exception as e:
+            print(f"❌ Error converting shape to mesh: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    @staticmethod
     def shape_to_mesh(shape, deflection: float = 0.1) -> Optional[trimesh.Trimesh]:
         """
         Convert a CadQuery/OCP shape to a trimesh.Trimesh object.
@@ -27,106 +190,11 @@ class STEPMeshConverter:
         Returns:
             trimesh.Trimesh object or None if conversion fails
         """
-        if not HAS_OCP:
-            print("❌ cadquery-ocp libraries not available")
+        result = STEPMeshConverter.shape_to_mesh_with_face_map(shape, deflection)
+        if result is None:
             return None
-
-        try:
-            from OCP.BRepMesh import BRepMesh_IncrementalMesh
-            from OCP.TopExp import TopExp_Explorer
-            from OCP.TopAbs import TopAbs_FACE
-            from OCP.TopLoc import TopLoc_Location
-        except ImportError as e:
-            print(f"❌ OCP import failed: {e}")
-            return None
-
-        try:
-            # Clamp deflection to valid range
-            deflection = max(0.001, min(1.0, deflection))
-            print(f"Converting STEP shape to mesh (deflection={deflection})...")
-
-            # Create mesh from shape
-            mesh_maker = BRepMesh_IncrementalMesh(shape, float(deflection), False, 0.5)
-            mesh_maker.Perform()
-
-            if not mesh_maker.IsDone():
-                print("❌ Mesh creation failed")
-                return None
-
-            # Extract vertices and faces
-            vertices = []
-            faces = []
-
-            explorer = TopExp_Explorer(shape, TopAbs_FACE)
-            
-            face_count = 0
-            triangulated_count = 0
-            while explorer.More():
-                face_count += 1
-                face = explorer.Current()
-                
-                # Get triangulation from face - BRepMesh stores it in the face itself
-                location = TopLoc_Location()
-                triangulation = None
-                
-                # First try with location (Standard method)
-                try:
-                    # This is the correct way to get triangulation from a meshed shape
-                    from OCP.Handle import Handle_Poly_Triangulation
-                    triangulation = face.Triangulation(location)
-                except Exception:
-                    # Some faces may legitimately lack triangulation
-                    pass
-
-                if triangulation is not None:
-                    triangulated_count += 1
-                    face_triangles = triangulation.Triangles()
-                    face_nodes = triangulation.Nodes()
-
-                    # Precompute transformation from location, if any
-                    trsf = None
-                    if not location.IsIdentity():
-                        trsf = location.Transformation()
-
-                    # Add vertices for this face
-                    face_vertex_offset = len(vertices)
-                    for i in range(1, face_nodes.Length() + 1):
-                        node = face_nodes.Value(i)
-                        if trsf is not None:
-                            node = node.Transformed(trsf)
-                        vertices.append([node.X(), node.Y(), node.Z()])
-
-                    # Add faces
-                    for i in range(1, face_triangles.Length() + 1):
-                        triangle = face_triangles.Value(i)
-                        v1 = triangle.Value(1) - 1 + face_vertex_offset
-                        v2 = triangle.Value(2) - 1 + face_vertex_offset
-                        v3 = triangle.Value(3) - 1 + face_vertex_offset
-                        faces.append([v1, v2, v3])
-
-                explorer.Next()
-            
-            print(f"  Explored {face_count} faces, triangulated {triangulated_count}, extracted {len(faces)} triangles")
-
-            if not vertices or not faces:
-                print("❌ No mesh data extracted")
-                return None
-
-            # Create trimesh
-            mesh = trimesh.Trimesh(
-                vertices=np.array(vertices),
-                faces=np.array(faces),
-                process=False,
-            )
-
-            print(f"✓ Converted to mesh: {len(vertices)} vertices, {len(faces)} faces")
-            return mesh
-
-        except Exception as e:
-            print(f"❌ Error converting shape to mesh: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+        mesh, _face_map = result
+        return mesh
 
     @staticmethod
     def mesh_to_shape(mesh: trimesh.Trimesh):

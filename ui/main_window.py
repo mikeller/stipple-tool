@@ -122,20 +122,21 @@ class ProcessingThread(QThread):
             # Stencil approach parameters
             strip_count = 8  # Number of strips to divide geometry
             overlap = 0.3  # 30% overlap between strips
-            batch_size = 2  # Small batches to avoid geometry fragmentation
+            batch_size = 10  # Spheres per boolean cut — max ~10 for reliable OCP output
             
             def on_status(msg: str):
                 if self.is_cancelled():
                     raise RuntimeError("Processing cancelled by user")
                 self.status.emit(msg)
-                # Simulate progress updates based on status messages
-                if "strip" in msg.lower():
-                    # Extract strip number if possible and update progress
-                    import re
-                    match = re.search(r'(\d+)/(\d+)', msg)
-                    if match:
-                        curr, total = int(match.group(1)), int(match.group(2))
-                        self.progress.emit(int(20 + (curr / total) * 70))
+                # Update progress based on status messages
+                import re
+                # Match chunk or batch progress
+                match = re.search(r'Sphere (\d+)/(\d+)', msg)
+                if match:
+                    curr, total = int(match.group(1)), int(match.group(2))
+                    self.progress.emit(int(25 + (curr / total) * 65))
+                elif 'Stippling complete' in msg:
+                    self.progress.emit(90)
 
             def on_cancel_check():
                 if self.is_cancelled():

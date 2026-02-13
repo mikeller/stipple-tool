@@ -3,33 +3,34 @@ Stencil-based stippling processor.
 
 Strategy:
 1. Identify target colored faces on the original shape.
-2. Compute bounding box over target faces.
-3. Sweep strips along longest axis.
-4. For each strip:
-   - Filter target faces whose centroids fall within the strip bounds.
-   - Generate sphere positions only for those faces.
-   - Apply spheres directly to the main shape (small batch).
+2. Triangulate the shape so sphere positions lie on actual trimmed faces.
+3. Generate sphere positions per face, proportional to area.
+4. Interleave positions from all faces and cut individually.
+   Each cut.Build() runs in a thread with a timeout to catch hangs.
+5. Escalation detection stops early if cuts get too slow.
+6. Save the stippled solid — partial coverage is saved if stopped early.
 
-This limits complexity by only generating spheres for a subset of faces at a time,
-while always operating on the single main shape.
+Fuzzy booleans (SetFuzzyValue) relax geometric tolerance so near-tangent
+intersections are resolved reliably.
 """
 
-import math
 import random
 import time
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Callable, List, Optional, Tuple
 
+from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+from OCP.BRep import BRep_Tool
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
-from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepGProp import BRepGProp
+from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeSphere
-from OCP.Bnd import Bnd_Box
 from OCP.GProp import GProp_GProps
-from OCP.ShapeFix import ShapeFix_Shape
-from OCP.TopAbs import TopAbs_FACE
+from OCP.TopAbs import TopAbs_FACE, TopAbs_IN, TopAbs_SOLID
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopoDS import TopoDS, TopoDS_Shape, TopoDS_Compound, TopoDS_Builder
+from OCP.TopLoc import TopLoc_Location
+from OCP.TopTools import TopTools_ListOfShape
+from OCP.TopoDS import TopoDS, TopoDS_Shape
 from OCP.gp import gp_Pnt, gp_Vec
 
 from core.color_analyzer import ColorAnalyzer
@@ -37,7 +38,7 @@ from core.step_loader import STEPLoader
 
 
 class StencilStippleProcessor:
-    """Stencil-based stippling to reduce boolean complexity."""
+    """Stencil-based stippling using fuzzy boolean sphere cuts."""
 
     def __init__(self):
         self.color_analyzer = ColorAnalyzer()
@@ -52,7 +53,7 @@ class StencilStippleProcessor:
         spheres_per_mm2: float = 0.12,
         strip_count: int = 6,
         overlap: float = 0.2,
-        batch_size: int = 3,
+        batch_size: int = 10,
         size_variation: bool = True,
         status_callback: Optional[Callable] = None,
         cancel_callback: Optional[Callable] = None,
@@ -101,134 +102,281 @@ class StencilStippleProcessor:
 
             emit_status(f"Extracted {len(target_faces_data)} target face geometries")
 
-            # Compute bounding box over target faces
-            bbox = Bnd_Box()
-            for face, _, _ in target_faces_data:
-                BRepBndLib.Add_s(face, bbox)
-            min_x, min_y, min_z, max_x, max_y, max_z = bbox.Get()
+            # Triangulate the shape so _generate_sphere_positions_on_faces
+            # can sample points from the mesh.  This guarantees every
+            # sampled point lies on the actual trimmed face (unlike raw
+            # UV sampling, which can produce points outside trim curves).
+            emit_status("Triangulating shape...")
+            mesh = BRepMesh_IncrementalMesh(loader.shape, 0.1, False, 0.5, True)
+            mesh.Perform()
 
-            # Determine longest axis for strip sweep
-            dx, dy, dz = max_x - min_x, max_y - min_y, max_z - min_z
-            if dx >= dy and dx >= dz:
-                axis = 0  # x
-                axis_min, axis_max = min_x, max_x
-            elif dy >= dx and dy >= dz:
-                axis = 1  # y
-                axis_min, axis_max = min_y, max_y
-            else:
-                axis = 2  # z
-                axis_min, axis_max = min_z, max_z
+            # Extract parent solid for point-in-solid classification
+            # (used to verify sphere centres are positioned inside the shape)
+            parent_solid = None
+            sol_exp = TopExp_Explorer(loader.shape, TopAbs_SOLID)
+            if sol_exp.More():
+                parent_solid = TopoDS.Solid_s(sol_exp.Current())
 
-            axis_names = ["x", "y", "z"]
-            axis_len = max(1e-6, axis_max - axis_min)
-            strip_len = axis_len / max(1, strip_count)
-            overlap_len = strip_len * max(0.0, min(0.5, overlap))
+            # Phase 1: Generate sphere positions across ALL target faces
+            # Each face gets spheres proportional to its area — no per-strip caps
+            total_area = sum(area for _, _, area in target_faces_data)
+            total_spheres_target = max(3, int(total_area * spheres_per_mm2))
 
-            emit_status(
-                f"Sweep axis={axis_names[axis]}, range=[{axis_min:.2f}, {axis_max:.2f}], strips={strip_count}"
+            emit_status(f"Total target area: {total_area:.1f} mm², target spheres: {total_spheres_target}")
+
+            sphere_positions = self._generate_sphere_positions_on_faces(
+                target_faces_data, total_spheres_target, sphere_radius,
+                sphere_depth, size_variation, parent_solid
             )
 
-            current_shape = loader.shape
-            total_spheres_applied = 0
+            # sphere_positions is now a list of per-face groups
+            face_groups = sphere_positions
 
-            for i in range(strip_count):
-                check_cancel()
-                strip_start = axis_min + i * strip_len - overlap_len
-                strip_end = axis_min + (i + 1) * strip_len + overlap_len
+            if not face_groups:
+                emit_status("No sphere positions generated")
+                return None
 
-                emit_status(f"\n=== STRIP {i + 1}/{strip_count} [{strip_start:.2f} - {strip_end:.2f}] ===")
+            total = sum(len(g) for g in face_groups)
+            emit_status(
+                f"Generated {total} sphere positions across "
+                f"{len(face_groups)} faces"
+            )
 
-                # Filter faces whose centroid falls in this strip
-                strip_faces = []
-                for face, centroid, area in target_faces_data:
-                    c_val = centroid[axis]
-                    if strip_start <= c_val <= strip_end:
-                        strip_faces.append((face, centroid, area))
+            # Phase 2: Individual fuzzy boolean cuts, face by face.
+            #
+            # Process spheres in face order (not shuffled) so every
+            # face gets at least some coverage before the shape becomes
+            # too complex.  Each cut.Build() runs in a thread with a
+            # timeout.  An escalation detector stops processing when
+            # average cut time exceeds a threshold — this prevents the
+            # tool from hanging indefinitely as accumulated complexity
+            # makes each subsequent boolean operation slower.
+            emit_status("Cutting spheres...")
+            cut_start = time.time()
+            current_shape = parent_solid if parent_solid else loader.shape
+            applied = 0
+            skipped = 0
+            timed_out = 0
 
-                if not strip_faces:
-                    emit_status("No target faces in this strip - skipping")
-                    continue
+            # Measure initial volume
+            init_props = GProp_GProps()
+            BRepGProp.VolumeProperties_s(current_shape, init_props)
+            current_volume = abs(init_props.Mass())
+            initial_volume = current_volume
 
-                strip_area = sum(area for _, _, area in strip_faces)
-                num_spheres = max(3, int(strip_area * spheres_per_mm2))
-                # Cap to prevent complexity blowup - allow more per strip for dense coverage
-                max_per_strip = 150
-                num_spheres = min(num_spheres, max_per_strip)
+            # Flatten face_groups into ordered list, interleaving faces
+            # so early cuts are distributed across all faces
+            max_face_len = max(len(g) for g in face_groups)
+            ordered_positions: List[Tuple[gp_Pnt, float, gp_Vec]] = []
+            for slot in range(max_face_len):
+                for group in face_groups:
+                    if slot < len(group):
+                        ordered_positions.append(group[slot])
 
-                emit_status(f"Faces: {len(strip_faces)}, Area: {strip_area:.1f} mm², Spheres: {num_spheres}")
+            total = len(ordered_positions)
+            report_interval = max(1, total // 20)
 
-                # Generate sphere positions on these faces
-                sphere_positions = self._generate_sphere_positions_on_faces(
-                    strip_faces, num_spheres, sphere_radius, size_variation
-                )
+            # Per-cut timeout
+            cut_timeout = 10.0  # seconds
+            # Escalation detection
+            recent_times: List[float] = []
+            max_recent = 10
+            escalation_threshold = 5.0
+            consecutive_timeouts = 0
+            max_consecutive_timeouts = 5
+            # Consecutive validation failures — stop when no cuts succeed
+            consecutive_validation_fails = 0
+            max_consecutive_validation_fails = 50
+            # Adaptive back-off for repeated failures
+            global_scale = 1.0
+            min_global_scale = 0.5
+            backoff_trigger = 25
+            backoff_factor = 0.85
 
-                if not sphere_positions:
-                    emit_status("No sphere positions generated - skipping")
-                    continue
+            max_sphere_radius = sphere_radius * (1.4 if size_variation else 1.0)
+            max_single_sphere_vol = (
+                (4.0 / 3.0) * 3.14159 * max_sphere_radius ** 3
+            )
 
-                emit_status(f"Generated {len(sphere_positions)} sphere positions")
+            executor = ThreadPoolExecutor(max_workers=1)
 
-                # Apply spheres in small batches
-                strip_spheres = 0
-                failed_batches = 0
-                num_batches = (len(sphere_positions) + batch_size - 1) // batch_size
-                for batch_idx, batch_start in enumerate(range(0, len(sphere_positions), batch_size)):
+            try:
+                for i, (centre, radius, outward_dir) in enumerate(ordered_positions):
                     check_cancel()
-                    batch = sphere_positions[batch_start:batch_start + batch_size]
 
-                    # Progress indicator
-                    if batch_idx % 5 == 0 or batch_idx == num_batches - 1:
-                        emit_status(f"  Batch {batch_idx + 1}/{num_batches}...")
-
-                    # Create compound of spheres
-                    builder = TopoDS_Builder()
-                    compound = TopoDS_Compound()
-                    builder.MakeCompound(compound)
-
-                    spheres_in_batch = 0
-                    for center, radius in batch:
-                        try:
-                            sphere = BRepPrimAPI_MakeSphere(center, radius).Shape()
-                            builder.Add(compound, sphere)
-                            spheres_in_batch += 1
-                        except Exception as e:
-                            emit_status(f"Sphere creation failed: {e}")
-
-                    if spheres_in_batch == 0:
-                        continue
-
-                    # Cut from current shape with timing
+                    t0 = time.time()
                     try:
-                        cut_start = time.time()
-                        cut_op = BRepAlgoAPI_Cut(current_shape, compound)
-                        cut_op.Build()
-                        cut_time = time.time() - cut_start
-                        
-                        if cut_time > 10:
-                            emit_status(f"  Warning: batch {batch_idx + 1} took {cut_time:.1f}s")
-                        
-                        if cut_op.IsDone():
-                            new_shape = cut_op.Shape()
-                            if not new_shape.IsNull():
-                                # Accept the cut - shape validity is confirmed by IsDone() and IsNull() checks
-                                # (cut result might be a shell/face and legitimately have 0 volume)
-                                current_shape = new_shape
-                                total_spheres_applied += spheres_in_batch
-                                strip_spheres += spheres_in_batch
-                            else:
-                                failed_batches += 1
-                        else:
-                            failed_batches += 1
-                    except Exception as e:
-                        emit_status(f"Batch cut failed: {e}")
+                        attempt_scales = (1.0, 0.85, 0.7)
+                        success = False
+                        timed_out_this_cut = False
 
-                emit_status(f"Strip {i + 1} complete: {strip_spheres} spheres, total: {total_spheres_applied}", )
-                if failed_batches > 0:
-                    emit_status(f"  ({failed_batches} batches could not be applied)")
+                        for scale in attempt_scales:
+                            attempt_radius = radius * global_scale * scale
+                            if attempt_radius <= 0:
+                                continue
+
+                            sphere = BRepPrimAPI_MakeSphere(
+                                centre, attempt_radius
+                            ).Shape()
+
+                            cut = BRepAlgoAPI_Cut()
+                            args = TopTools_ListOfShape()
+                            args.Append(current_shape)
+                            cut.SetArguments(args)
+                            tools = TopTools_ListOfShape()
+                            tools.Append(sphere)
+                            cut.SetTools(tools)
+                            cut.SetFuzzyValue(0.01)
+
+                            future = executor.submit(cut.Build)
+                            try:
+                                future.result(timeout=cut_timeout)
+                            except FutureTimeout:
+                                timed_out += 1
+                                consecutive_timeouts += 1
+                                dt = time.time() - t0
+                                emit_status(
+                                    f"  Sphere {i+1}: timed out ({dt:.1f}s)"
+                                )
+                                executor.shutdown(wait=False)
+                                executor = ThreadPoolExecutor(max_workers=1)
+                                timed_out_this_cut = True
+                                if consecutive_timeouts >= max_consecutive_timeouts:
+                                    emit_status(
+                                        f"  {max_consecutive_timeouts} "
+                                        f"consecutive timeouts — stopping"
+                                    )
+                                    break
+                                break
+
+                            consecutive_timeouts = 0
+
+                            if cut.IsDone() and not cut.Shape().IsNull():
+                                result = cut.Shape()
+
+                                # Volume validation: ensure the cut didn't
+                                # produce degenerate geometry
+                                vp = GProp_GProps()
+                                BRepGProp.VolumeProperties_s(result, vp)
+                                new_vol = abs(vp.Mass())
+
+                                if new_vol < 1e-3:
+                                    continue
+                                if new_vol > current_volume * 1.001:
+                                    continue
+                                if (current_volume - new_vol
+                                        > max_single_sphere_vol * 3):
+                                    continue
+
+                                # Strict validation: the outward sphere cap
+                                # must be outside the resulting solid.
+                                if outward_dir.Magnitude() > 1e-6:
+                                    outward_dir.Normalize()
+                                    probe = gp_Pnt(
+                                        centre.X() + outward_dir.X() * attempt_radius,
+                                        centre.Y() + outward_dir.Y() * attempt_radius,
+                                        centre.Z() + outward_dir.Z() * attempt_radius,
+                                    )
+                                    try:
+                                        post_classifier = BRepClass3d_SolidClassifier(result)
+                                        post_classifier.Perform(probe, 1e-4)
+                                        if post_classifier.State() == TopAbs_IN:
+                                            continue
+                                    except Exception:
+                                        continue
+
+                                current_shape = result
+                                current_volume = new_vol
+                                applied += 1
+                                consecutive_validation_fails = 0
+                                success = True
+                                break
+
+                        if timed_out_this_cut:
+                            if consecutive_timeouts >= max_consecutive_timeouts:
+                                break
+                            continue
+
+                        if not success:
+                            skipped += 1
+                            consecutive_validation_fails += 1
+                    except Exception:
+                        skipped += 1
+                        consecutive_validation_fails += 1
+
+                    if (consecutive_validation_fails
+                            >= backoff_trigger
+                            and global_scale > min_global_scale):
+                        global_scale *= backoff_factor
+                        if global_scale < min_global_scale:
+                            global_scale = min_global_scale
+                        emit_status(
+                            f"  Back-off: reducing sphere scale to "
+                            f"{global_scale:.2f}"
+                        )
+                        consecutive_validation_fails = 0
+                    elif (consecutive_validation_fails
+                            >= max_consecutive_validation_fails):
+                        emit_status(
+                            f"  {max_consecutive_validation_fails} "
+                            f"consecutive failed cuts — shape too "
+                            f"complex, stopping at {applied} spheres"
+                        )
+                        break
+
+                    dt = time.time() - t0
+                    recent_times.append(dt)
+                    if len(recent_times) > max_recent:
+                        recent_times.pop(0)
+
+                    # Escalation detection
+                    if (len(recent_times) == max_recent
+                            and sum(recent_times) / max_recent
+                            > escalation_threshold):
+                        avg = sum(recent_times) / max_recent
+                        emit_status(
+                            f"  Cuts slowing (avg {avg:.1f}s/cut) — "
+                            f"stopping at {applied} spheres"
+                        )
+                        break
+
+                    # Progress
+                    if (i + 1) % report_interval == 0 or i == total - 1:
+                        elapsed = time.time() - cut_start
+                        rate = (i + 1) / elapsed if elapsed > 0 else 0
+                        eta = (total - i - 1) / rate if rate > 0 else 0
+                        emit_status(
+                            f"  Sphere {i+1}/{total} "
+                            f"({applied} ok, {skipped} skip) "
+                            f"[{elapsed:.0f}s, ~{eta:.0f}s left]"
+                        )
+            finally:
+                executor.shutdown(wait=False)
+
+            skipped = total - applied
+
+            cut_time = time.time() - cut_start
+
+            # Final volume report
+            final_props = GProp_GProps()
+            BRepGProp.VolumeProperties_s(current_shape, final_props)
+            final_volume = abs(final_props.Mass())
+            removed = initial_volume - final_volume
+
+            emit_status(
+                f"Stippling complete: {applied} spheres applied, "
+                f"{skipped} skipped"
+                + (f" ({timed_out} timed out)" if timed_out else "")
+                + f" in {cut_time:.1f}s"
+            )
+            emit_status(
+                f"Volume: {initial_volume:.1f} → {final_volume:.1f} mm³ "
+                f"(removed {removed:.1f} mm³, "
+                f"{removed/initial_volume*100:.2f}%)"
+            )
 
             # Save final shape
-            emit_status(f"\nSaving result: {output_path}")
-            emit_status(f"Total spheres applied: {total_spheres_applied}")
+            emit_status(f"Saving result: {output_path}")
             if not loader.save_step(output_path, current_shape):
                 emit_status("Failed to write final STEP")
                 return None
@@ -247,67 +395,202 @@ class StencilStippleProcessor:
         faces_data: List[Tuple[TopoDS_Shape, Tuple[float, float, float], float]],
         num_spheres: int,
         base_radius: float,
+        sphere_depth: float,
         size_variation: bool,
-    ) -> List[Tuple[gp_Pnt, float]]:
-        """Generate sphere positions distributed across faces by area."""
-        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        parent_solid: Optional[TopoDS_Shape] = None,
+    ) -> List[List[Tuple[gp_Pnt, float, gp_Vec]]]:
+        """Generate sphere positions distributed across faces by area.
 
-        positions = []
+        Returns a list of per-face groups, where each group is a list
+        of (centre, radius) tuples for that face.  This grouping allows
+        the caller to cut all spheres for one face in a single boolean
+        operation.
+
+        Uses face triangulation to sample points that are guaranteed to
+        lie on the actual trimmed face (not outside it, as raw UV sampling
+        can produce on faces with large untrimmed parameter domains).
+
+        For each sampled point, probes along the triangle normal to
+        determine the inward direction, then offsets the sphere centre
+        to create an inward indentation.
+        """
+        face_groups: List[List[Tuple[gp_Pnt, float, gp_Vec]]] = []
+        total_placed = 0
         total_area = sum(area for _, _, area in faces_data)
         if total_area <= 0:
-            return positions
+            return face_groups
+
+        # Build classifier for inside/outside checks
+        classifier = None
+        if parent_solid is not None:
+            try:
+                classifier = BRepClass3d_SolidClassifier(parent_solid)
+            except Exception:
+                pass
 
         for face, _, area in faces_data:
             # Allocate spheres proportionally to face area
             face_spheres = max(1, int(num_spheres * (area / total_area)))
+            face_positions: List[Tuple[gp_Pnt, float, gp_Vec]] = []
 
             try:
-                adaptor = BRepAdaptor_Surface(face)
-                u_min, u_max = adaptor.FirstUParameter(), adaptor.LastUParameter()
-                v_min, v_max = adaptor.FirstVParameter(), adaptor.LastVParameter()
+                # Get the face triangulation (already meshed on the shape)
+                loc = TopLoc_Location()
+                tri = BRep_Tool.Triangulation_s(face, loc)
+                if tri is None:
+                    continue
+
+                trsf = loc.Transformation()
+
+                # Collect triangles with vertices and areas
+                triangles = []  # [(p1, p2, p3, area), ...]
+                total_tri_area = 0.0
+                for t_idx in range(1, tri.NbTriangles() + 1):
+                    tri_obj = tri.Triangle(t_idx)
+                    i1, i2, i3 = tri_obj.Get()
+                    p1 = tri.Node(i1)
+                    p2 = tri.Node(i2)
+                    p3 = tri.Node(i3)
+                    p1.Transform(trsf)
+                    p2.Transform(trsf)
+                    p3.Transform(trsf)
+
+                    v1 = gp_Vec(p1, p2)
+                    v2 = gp_Vec(p1, p3)
+                    tri_area = 0.5 * v1.Crossed(v2).Magnitude()
+                    if tri_area > 1e-10:
+                        triangles.append((p1, p2, p3, tri_area))
+                        total_tri_area += tri_area
+
+                if not triangles:
+                    continue
+
+                # Build cumulative area array for weighted sampling
+                cum_areas = []
+                cumulative = 0.0
+                for _, _, _, t_area in triangles:
+                    cumulative += t_area
+                    cum_areas.append(cumulative)
+
+                # Determine inward normal direction for this face ONCE
+                # using the centroid of a representative triangle
+                inward_sign = -1.0  # default
+                if classifier is not None:
+                    rep = triangles[len(triangles) // 2]
+                    rp1, rp2, rp3, _ = rep
+                    mid_pnt = gp_Pnt(
+                        (rp1.X() + rp2.X() + rp3.X()) / 3,
+                        (rp1.Y() + rp2.Y() + rp3.Y()) / 3,
+                        (rp1.Z() + rp2.Z() + rp3.Z()) / 3,
+                    )
+                    probe_normal = gp_Vec(rp1, rp2).Crossed(gp_Vec(rp1, rp3))
+                    if probe_normal.Magnitude() > 1e-6:
+                        probe_normal.Normalize()
+                        probe_dist = max(base_radius, 1.0)
+                        probe_pos = gp_Pnt(
+                            mid_pnt.X() + probe_normal.X() * probe_dist,
+                            mid_pnt.Y() + probe_normal.Y() * probe_dist,
+                            mid_pnt.Z() + probe_normal.Z() * probe_dist,
+                        )
+                        probe_neg = gp_Pnt(
+                            mid_pnt.X() - probe_normal.X() * probe_dist,
+                            mid_pnt.Y() - probe_normal.Y() * probe_dist,
+                            mid_pnt.Z() - probe_normal.Z() * probe_dist,
+                        )
+                        classifier.Perform(probe_pos, 1e-4)
+                        pos_inside = classifier.State() == TopAbs_IN
+                        classifier.Perform(probe_neg, 1e-4)
+                        neg_inside = classifier.State() == TopAbs_IN
+
+                        if pos_inside and not neg_inside:
+                            inward_sign = 1.0
+                        elif neg_inside and not pos_inside:
+                            inward_sign = -1.0
 
                 for _ in range(face_spheres):
-                    # Random UV position
-                    u = u_min + random.random() * (u_max - u_min)
-                    v = v_min + random.random() * (v_max - v_min)
+                    # Pick a random triangle weighted by area
+                    r = random.random() * total_tri_area
+                    t_idx = 0
+                    for j, ca in enumerate(cum_areas):
+                        if ca >= r:
+                            t_idx = j
+                            break
 
-                    # Get point on surface
-                    pnt = adaptor.Value(u, v)
+                    tp1, tp2, tp3, _ = triangles[t_idx]
 
-                    # Compute normal via derivative
-                    try:
-                        d1u = gp_Vec()
-                        d1v = gp_Vec()
-                        p_temp = gp_Pnt()
-                        adaptor.D1(u, v, p_temp, d1u, d1v)
-                        normal = d1u.Crossed(d1v)
-                        if normal.Magnitude() > 1e-6:
-                            normal.Normalize()
-                        else:
-                            normal = gp_Vec(0, 0, 1)
-                    except Exception:
-                        normal = gp_Vec(0, 0, 1)
+                    # Random barycentric coordinates
+                    s = random.random()
+                    t_val = random.random()
+                    if s + t_val > 1.0:
+                        s = 1.0 - s
+                        t_val = 1.0 - t_val
+                    w = 1.0 - s - t_val
 
-                    # Offset point inward by sphere depth
-                    depth = base_radius * 0.5
-                    center = gp_Pnt(
-                        pnt.X() - normal.X() * depth,
-                        pnt.Y() - normal.Y() * depth,
-                        pnt.Z() - normal.Z() * depth,
+                    pnt = gp_Pnt(
+                        w * tp1.X() + s * tp2.X() + t_val * tp3.X(),
+                        w * tp1.Y() + s * tp2.Y() + t_val * tp3.Y(),
+                        w * tp1.Z() + s * tp2.Z() + t_val * tp3.Z(),
                     )
 
-                    # Vary radius if enabled
+                    # Normal from triangle edges
+                    normal = gp_Vec(tp1, tp2).Crossed(gp_Vec(tp1, tp3))
+                    if normal.Magnitude() > 1e-6:
+                        normal.Normalize()
+                    else:
+                        continue
+
+                    # Determine actual sphere radius
                     if size_variation:
                         radius = base_radius * (0.6 + random.random() * 0.8)
                     else:
                         radius = base_radius
 
-                    positions.append((center, radius))
+                    # Treat sphere_depth as a maximum. For smaller
+                    # spheres, scale depth down so indentations never
+                    # exceed the requested maximum depth.
+                    effective_depth = sphere_depth * (radius / base_radius)
+                    if effective_depth > sphere_depth:
+                        effective_depth = sphere_depth
+                    if effective_depth > radius:
+                        effective_depth = radius
 
-                    if len(positions) >= num_spheres:
-                        return positions
+                    # Centre goes inward by (radius - effective_depth)
+                    offset = radius - effective_depth
+                    if offset < 0:
+                        offset = 0
+
+                    center = gp_Pnt(
+                        pnt.X() + inward_sign * normal.X() * offset,
+                        pnt.Y() + inward_sign * normal.Y() * offset,
+                        pnt.Z() + inward_sign * normal.Z() * offset,
+                    )
+
+                    # Ensure the center lands inside the solid.
+                    if classifier is not None:
+                        classifier.Perform(center, 1e-4)
+                        if classifier.State() != TopAbs_IN:
+                            center = gp_Pnt(
+                                pnt.X() - inward_sign * normal.X() * offset,
+                                pnt.Y() - inward_sign * normal.Y() * offset,
+                                pnt.Z() - inward_sign * normal.Z() * offset,
+                            )
+                            classifier.Perform(center, 1e-4)
+                            if classifier.State() != TopAbs_IN:
+                                continue
+
+                    outward_dir = gp_Vec(normal.X(), normal.Y(), normal.Z())
+                    outward_dir.Multiply(-inward_sign)
+                    face_positions.append((center, radius, outward_dir))
+                    total_placed += 1
+
+                    if total_placed >= num_spheres:
+                        face_groups.append(face_positions)
+                        return face_groups
 
             except Exception:
                 continue
 
-        return positions
+            if face_positions:
+                face_groups.append(face_positions)
+
+        return face_groups

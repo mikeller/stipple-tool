@@ -25,7 +25,7 @@ def main():
         default=0.2,
         help="Overlap ratio between strips (0.0-0.9)",
     )
-    parser.add_argument("--batch", type=int, default=5, help="Batch size per local cut")
+    parser.add_argument("--batch", type=int, default=10, help="Spheres per boolean cut (max 10 for reliable output)")
     parser.add_argument("--no-variation", action="store_true", help="Disable size variation")
 
     args = parser.parse_args()

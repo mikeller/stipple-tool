@@ -85,6 +85,7 @@ class MeshStippleEngine:
         sigma = max(0.2, radius * 0.5)
 
         displacement = np.zeros(len(vertices), dtype=np.float64)
+        max_displacement = 0.0
 
         for i, point in enumerate(points):
             if cancel_callback:
@@ -108,9 +109,17 @@ class MeshStippleEngine:
             for j, v_idx in enumerate(idxs_global):
                 if delta[j] > displacement[v_idx]:
                     displacement[v_idx] = delta[j]
+                    if displacement[v_idx] > max_displacement:
+                        max_displacement = displacement[v_idx]
 
             if progress_callback and (i % max(1, count // 50) == 0):
                 progress_callback(i + 1, count)
+
+        if status_callback:
+            moved = int(np.count_nonzero(displacement > 1e-6))
+            status_callback(
+                f"Displacement max: {max_displacement:.4f} mm on {moved} vertices"
+            )
 
         vertices = vertices - (vertex_normals * displacement[:, None])
         mesh_out.vertices = vertices
