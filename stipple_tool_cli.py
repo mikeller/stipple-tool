@@ -27,6 +27,30 @@ def main():
     )
     parser.add_argument("--batch", type=int, default=10, help="Spheres per boolean cut (max 10 for reliable output)")
     parser.add_argument("--no-variation", action="store_true", help="Disable size variation")
+    parser.add_argument(
+        "--size-variation-mode",
+        choices=["uniform", "gaussian"],
+        default="uniform",
+        help="Size variation distribution (default: uniform)",
+    )
+    parser.add_argument(
+        "--size-variation-sigma",
+        type=float,
+        default=0.2,
+        help="Gaussian sigma for size variation (default: 0.2)",
+    )
+    parser.add_argument(
+        "--size-variation-min",
+        type=float,
+        default=0.7,
+        help="Minimum size scale for variation (default: 0.7)",
+    )
+    parser.add_argument(
+        "--size-variation-max",
+        type=float,
+        default=1.3,
+        help="Maximum size scale for variation (default: 1.3)",
+    )
 
     args = parser.parse_args()
 
@@ -41,6 +65,14 @@ def main():
     print(f"Strips:      {args.strips}")
     print(f"Overlap:     {args.overlap:.0%}")
     print(f"Batch:       {args.batch}")
+    if not args.no_variation:
+        print(f"Size mode:   {args.size_variation_mode}")
+        if args.size_variation_mode == "gaussian":
+            print(
+                "Size sigma:  "
+                f"{args.size_variation_sigma} "
+                f"(min {args.size_variation_min}, max {args.size_variation_max})"
+            )
     print("=" * 50)
 
     processor = StencilStippleProcessor()
@@ -55,6 +87,10 @@ def main():
         overlap=args.overlap,
         batch_size=args.batch,
         size_variation=not args.no_variation,
+        size_variation_mode=args.size_variation_mode,
+        size_variation_sigma=args.size_variation_sigma,
+        size_variation_min=args.size_variation_min,
+        size_variation_max=args.size_variation_max,
     )
 
     if result:

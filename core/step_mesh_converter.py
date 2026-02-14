@@ -214,12 +214,13 @@ class STEPMeshConverter:
             return None
 
         try:
-            from OCP.BRepBuilderAPI import BRepBuilderAPI_MakePolygon, BRepBuilderAPI_Sewing
+            from OCP.BRepBuilderAPI import BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeFace, BRepBuilderAPI_Sewing
             from OCP.gp import gp_Pnt
 
             print("Converting mesh back to STEP shape...")
 
             sewing = BRepBuilderAPI_Sewing()
+            face_count = 0
 
             for face_indices in mesh.faces:
                 polygon_maker = BRepBuilderAPI_MakePolygon()
@@ -230,12 +231,17 @@ class STEPMeshConverter:
 
                 polygon_maker.Close()
                 if polygon_maker.IsDone():
-                    sewing.Add(polygon_maker.Shape())
+                    # Create a face from the polygon wire
+                    face_maker = BRepBuilderAPI_MakeFace(polygon_maker.Wire())
+                    if face_maker.IsDone():
+                        sewing.Add(face_maker.Face())
+                        face_count += 1
 
+            print(f"  Sewing {face_count} triangular faces...")
             sewing.Perform()
             shell = sewing.SewedShape()
 
-            print(f"✓ Converted to STEP shape")
+            print(f"✓ Converted to STEP shape with {face_count} faces")
             return shell
 
         except Exception as e:

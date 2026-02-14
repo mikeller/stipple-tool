@@ -43,6 +43,22 @@ class StencilStippleProcessor:
     def __init__(self):
         self.color_analyzer = ColorAnalyzer()
 
+    def _count_solid_components(self, shape: TopoDS_Shape) -> int:
+        """Count the number of disconnected SOLID components in a shape.
+        
+        Returns the count of solid components. If the shape is disconnected
+        (multiple solids), we should reject it to avoid isolated "filled" geometry.
+        """
+        try:
+            count = 0
+            explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+            while explorer.More():
+                count += 1
+                explorer.Next()
+            return count
+        except Exception:
+            return 0
+
     def process_step_with_stencil_stippling(
         self,
         step_file: str,
@@ -55,6 +71,10 @@ class StencilStippleProcessor:
         overlap: float = 0.2,
         batch_size: int = 10,
         size_variation: bool = True,
+        size_variation_mode: str = "uniform",
+        size_variation_sigma: float = 0.2,
+        size_variation_min: float = 0.7,
+        size_variation_max: float = 1.3,
         status_callback: Optional[Callable] = None,
         cancel_callback: Optional[Callable] = None,
     ) -> Optional[str]:
@@ -125,8 +145,16 @@ class StencilStippleProcessor:
             emit_status(f"Total target area: {total_area:.1f} mm², target spheres: {total_spheres_target}")
 
             sphere_positions = self._generate_sphere_positions_on_faces(
-                target_faces_data, total_spheres_target, sphere_radius,
-                sphere_depth, size_variation, parent_solid
+                target_faces_data,
+                total_spheres_target,
+                sphere_radius,
+                sphere_depth,
+                size_variation,
+                size_variation_mode,
+                size_variation_sigma,
+                size_variation_min,
+                size_variation_max,
+                parent_solid,
             )
 
             # sphere_positions is now a list of per-face groups
@@ -177,23 +205,26 @@ class StencilStippleProcessor:
             report_interval = max(1, total // 20)
 
             # Per-cut timeout
-            cut_timeout = 10.0  # seconds
+            cut_timeout = 15.0  # seconds
             # Escalation detection
             recent_times: List[float] = []
             max_recent = 10
-            escalation_threshold = 5.0
+            escalation_threshold = 10.0  # Increased for deeper cuts (0.5mm depth)
             consecutive_timeouts = 0
             max_consecutive_timeouts = 5
             # Consecutive validation failures — stop when no cuts succeed
             consecutive_validation_fails = 0
-            max_consecutive_validation_fails = 50
+            max_consecutive_validation_fails = 150  # Try harder
             # Adaptive back-off for repeated failures
             global_scale = 1.0
-            min_global_scale = 0.5
-            backoff_trigger = 25
-            backoff_factor = 0.85
+            min_global_scale = 0.4  # Back off more aggressively
+            backoff_trigger = 40  # More permissive before backing off
+            backoff_factor = 0.85  # Smaller steps preserve more geometry
 
-            max_sphere_radius = sphere_radius * (1.4 if size_variation else 1.0)
+            if size_variation and size_variation_mode == "gaussian":
+                max_sphere_radius = sphere_radius * size_variation_max
+            else:
+                max_sphere_radius = sphere_radius * (1.4 if size_variation else 1.0)
             max_single_sphere_vol = (
                 (4.0 / 3.0) * 3.14159 * max_sphere_radius ** 3
             )
@@ -264,8 +295,22 @@ class StencilStippleProcessor:
                                     continue
                                 if new_vol > current_volume * 1.001:
                                     continue
-                                if (current_volume - new_vol
-                                        > max_single_sphere_vol * 3):
+                                removed_vol = current_volume - new_vol
+                                if removed_vol <= 0:
+                                    continue
+                                min_cut_vol = (
+                                    (4.0 / 3.0) * 3.14159
+                                    * attempt_radius ** 3 * 0.002
+                                )
+                                if removed_vol < min_cut_vol:
+                                    continue
+                                if removed_vol > max_single_sphere_vol * 3:
+                                    continue
+
+                                # Reject if boolean cut created disconnected solids
+                                # (isolated "filled" geometry around the cut area)
+                                solid_count = self._count_solid_components(result)
+                                if solid_count > 1:
                                     continue
 
                                 # Strict validation: the outward sphere cap
@@ -397,6 +442,10 @@ class StencilStippleProcessor:
         base_radius: float,
         sphere_depth: float,
         size_variation: bool,
+        size_variation_mode: str,
+        size_variation_sigma: float,
+        size_variation_min: float,
+        size_variation_max: float,
         parent_solid: Optional[TopoDS_Shape] = None,
     ) -> List[List[Tuple[gp_Pnt, float, gp_Vec]]]:
         """Generate sphere positions distributed across faces by area.
@@ -541,41 +590,51 @@ class StencilStippleProcessor:
 
                     # Determine actual sphere radius
                     if size_variation:
-                        radius = base_radius * (0.6 + random.random() * 0.8)
+                        if size_variation_mode == "gaussian":
+                            scale = random.gauss(1.0, size_variation_sigma)
+                            if scale < size_variation_min:
+                                scale = size_variation_min
+                            elif scale > size_variation_max:
+                                scale = size_variation_max
+                            radius = base_radius * scale
+                        else:
+                            radius = base_radius * (0.6 + random.random() * 0.8)
                     else:
                         radius = base_radius
 
-                    # Treat sphere_depth as a maximum. For smaller
-                    # spheres, scale depth down so indentations never
-                    # exceed the requested maximum depth.
-                    effective_depth = sphere_depth * (radius / base_radius)
-                    if effective_depth > sphere_depth:
-                        effective_depth = sphere_depth
+                    # Scale depth slightly with sphere size (radius ratio).
+                    # For larger spheres, use ~15% deeper cuts to improve coverage.
+                    # This balances geometric complexity with visual density.
+                    scale_factor = 1.0 + 0.15 * ((radius / base_radius) - 1.0)
+                    effective_depth = sphere_depth * scale_factor
+                    if effective_depth > sphere_depth * 1.5:
+                        effective_depth = sphere_depth * 1.5
                     if effective_depth > radius:
                         effective_depth = radius
 
-                    # Centre goes inward by (radius - effective_depth)
+                    # Centre goes outward by (radius - effective_depth) so
+                    # only a shallow cap intersects the solid.
                     offset = radius - effective_depth
                     if offset < 0:
                         offset = 0
 
                     center = gp_Pnt(
-                        pnt.X() + inward_sign * normal.X() * offset,
-                        pnt.Y() + inward_sign * normal.Y() * offset,
-                        pnt.Z() + inward_sign * normal.Z() * offset,
+                        pnt.X() - inward_sign * normal.X() * offset,
+                        pnt.Y() - inward_sign * normal.Y() * offset,
+                        pnt.Z() - inward_sign * normal.Z() * offset,
                     )
 
-                    # Ensure the center lands inside the solid.
+                    # Ensure the center lands outside the solid.
                     if classifier is not None:
                         classifier.Perform(center, 1e-4)
-                        if classifier.State() != TopAbs_IN:
+                        if classifier.State() == TopAbs_IN:
                             center = gp_Pnt(
-                                pnt.X() - inward_sign * normal.X() * offset,
-                                pnt.Y() - inward_sign * normal.Y() * offset,
-                                pnt.Z() - inward_sign * normal.Z() * offset,
+                                pnt.X() + inward_sign * normal.X() * offset,
+                                pnt.Y() + inward_sign * normal.Y() * offset,
+                                pnt.Z() + inward_sign * normal.Z() * offset,
                             )
                             classifier.Perform(center, 1e-4)
-                            if classifier.State() != TopAbs_IN:
+                            if classifier.State() == TopAbs_IN:
                                 continue
 
                     outward_dir = gp_Vec(normal.X(), normal.Y(), normal.Z())
