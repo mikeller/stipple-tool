@@ -9,6 +9,7 @@ def main():
     parser = argparse.ArgumentParser(description="Stencil-based stippling")
     parser.add_argument("input", help="Input STEP file")
     parser.add_argument("-o", "--output", required=True, help="Output STEP file")
+    parser.add_argument("--export-stl", help="Also export to STL file (optional)")
     parser.add_argument("-c", "--color", required=True, help="Target color (hex, e.g., #360200)")
     parser.add_argument(
         "--spheres-per-mm2",
@@ -58,6 +59,8 @@ def main():
     print("=" * 50)
     print(f"Input:       {args.input}")
     print(f"Output:      {args.output}")
+    if args.export_stl:
+        print(f"Export STL:  {args.export_stl}")
     print(f"Color:       {args.color}")
     print(f"Spheres/mm²: {args.spheres_per_mm2}")
     print(f"Radius:      {args.radius} mm")
@@ -95,6 +98,28 @@ def main():
 
     if result:
         print(f"\n✓ Successfully saved to: {result}")
+        
+        # Export STL if requested
+        if args.export_stl:
+            print("\nExporting to STL...")
+            from core.step_loader import STEPLoader
+            loader = STEPLoader()
+            if loader.load(result) and loader.shape is not None:
+                if processor.export_shape_to_stl(
+                    loader.shape,
+                    args.export_stl,
+                    linear_deflection=0.01,
+                    angular_deflection=0.5,
+                    status_callback=print,
+                ):
+                    print("✓ STL export complete")
+                else:
+                    print("✗ STL export failed")
+                    return 1
+            else:
+                print("✗ STL export failed: could not load STEP for meshing")
+                return 1
+        
         return 0
     else:
         print("\n✗ Processing failed")

@@ -43,6 +43,36 @@ class StencilStippleProcessor:
     def __init__(self):
         self.color_analyzer = ColorAnalyzer()
 
+    def _heal_shape_for_export(
+        self,
+        shape: TopoDS_Shape,
+        emit_status: Callable[[str], None],
+    ) -> TopoDS_Shape:
+        """Heal only when needed to avoid introducing artifacts."""
+        try:
+            from OCP.BRepCheck import BRepCheck_Analyzer
+
+            analyzer = BRepCheck_Analyzer(shape, True)
+            if analyzer.IsValid():
+                return shape
+        except Exception:
+            return shape
+
+        try:
+            from OCP.ShapeFix import ShapeFix_Shape
+
+            emit_status("Healing final shape for export...")
+            healer = ShapeFix_Shape()
+            healer.Init(shape)
+            healer.SetPrecision(1e-5)
+            healer.SetMaxTolerance(0.1)
+            healer.SetMinTolerance(1e-6)
+            healer.Perform()
+            return healer.Shape()
+        except Exception as e:
+            emit_status(f"Healing encountered issue: {e} (using original)")
+            return shape
+
     def _count_solid_components(self, shape: TopoDS_Shape) -> int:
         """Count the number of disconnected SOLID components in a shape.
         
@@ -420,6 +450,11 @@ class StencilStippleProcessor:
                 f"{removed/initial_volume*100:.2f}%)"
             )
 
+            current_shape = self._heal_shape_for_export(
+                current_shape,
+                emit_status,
+            )
+
             # Save final shape
             emit_status(f"Saving result: {output_path}")
             if not loader.save_step(output_path, current_shape):
@@ -434,6 +469,62 @@ class StencilStippleProcessor:
             emit_status(f"Error during stencil stippling: {e}")
             traceback.print_exc()
             return None
+
+    def export_shape_to_stl(
+        self,
+        shape: TopoDS_Shape,
+        output_path: str,
+        linear_deflection: float = 0.01,
+        angular_deflection: float = 0.5,
+        status_callback: Optional[Callable] = None,
+    ) -> bool:
+        """Export a shape to STL using OCP's mesher for reliable complex geometry.
+        
+        Args:
+            shape: The OCP shape to mesh
+            output_path: Path to save STL file
+            linear_deflection: Mesh accuracy (lower = finer, ~0.01 recommended)
+            angular_deflection: Angular deflection in degrees (~0.5)
+            status_callback: Optional callback for status messages
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        def emit_status(msg: str):
+            if status_callback:
+                status_callback(msg)
+            else:
+                print(msg)
+        
+        try:
+            from OCP.BRepMesh import BRepMesh_IncrementalMesh
+            from OCP.StlAPI import StlAPI_Writer
+            
+            emit_status(f"Meshing shape with deflection {linear_deflection}mm...")
+            mesher = BRepMesh_IncrementalMesh(
+                shape,
+                linear_deflection,
+                False,
+                angular_deflection,
+            )
+            mesher.Perform()
+            
+            if not mesher.IsDone():
+                emit_status("Meshing failed")
+                return False
+            
+            emit_status(f"Writing STL: {output_path}")
+            writer = StlAPI_Writer()
+            writer.Write(shape, output_path)
+            
+            emit_status(f"✓ STL exported to: {output_path}")
+            return True
+            
+        except Exception as e:
+            emit_status(f"STL export failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def _generate_sphere_positions_on_faces(
         self,
