@@ -328,10 +328,19 @@ class StencilStippleProcessor:
                                 removed_vol = current_volume - new_vol
                                 if removed_vol <= 0:
                                     continue
-                                min_cut_vol = (
-                                    (4.0 / 3.0) * 3.14159
-                                    * attempt_radius ** 3 * 0.002
-                                )
+                                
+                                # Validation threshold: stricter only for extremely shallow cuts
+                                # that indicate barely-touching geometry (< 0.5% of sphere volume).
+                                # Don't tie this to backoff state to avoid feedback loops.
+                                sphere_volume = (4.0 / 3.0) * 3.14159 * attempt_radius ** 3
+                                if removed_vol < sphere_volume * 0.005:
+                                    # Extremely shallow cut - likely a barely-touching or
+                                    # malformed sphere, use strict threshold
+                                    min_cut_vol = sphere_volume * 0.005
+                                else:
+                                    # Normal cut depth, use permissive threshold
+                                    min_cut_vol = sphere_volume * 0.002
+                                    
                                 if removed_vol < min_cut_vol:
                                     continue
                                 if removed_vol > max_single_sphere_vol * 3:
@@ -457,9 +466,31 @@ class StencilStippleProcessor:
 
             # Save final shape
             emit_status(f"Saving result: {output_path}")
-            if not loader.save_step(output_path, current_shape):
-                emit_status("Failed to write final STEP")
-                return None
+            
+            # Clean up the shape before saving to STEP
+            # Remove any degenerate edges/faces that might appear as artifacts
+            try:
+                from OCP.BRepCheck import BRepCheck_Analyzer
+                from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+                
+                # Make a clean copy first
+                copy_builder = BRepBuilderAPI_Copy(current_shape)
+                clean_shape = copy_builder.Shape()
+                
+                # Check if healing is needed
+                analyzer = BRepCheck_Analyzer(clean_shape, True)
+                if not analyzer.IsValid():
+                    emit_status("Validating shape for STEP export...")
+                    clean_shape = self._heal_shape_for_export(clean_shape, emit_status)
+                
+                if not loader.save_step(output_path, clean_shape):
+                    emit_status("Failed to write final STEP")
+                    return None
+            except Exception as e:
+                emit_status(f"Shape cleanup warning: {e}, saving anyway")
+                if not loader.save_step(output_path, current_shape):
+                    emit_status("Failed to write final STEP")
+                    return None
 
             emit_status("✓ Stencil stippling complete")
             return output_path
@@ -716,20 +747,30 @@ class StencilStippleProcessor:
                     )
 
                     # Ensure the center lands outside the solid.
+                    # Track if we had to flip the direction
+                    center_was_flipped = False
                     if classifier is not None:
                         classifier.Perform(center, 1e-4)
                         if classifier.State() == TopAbs_IN:
+                            # Flip the offset direction
                             center = gp_Pnt(
                                 pnt.X() + inward_sign * normal.X() * offset,
                                 pnt.Y() + inward_sign * normal.Y() * offset,
                                 pnt.Z() + inward_sign * normal.Z() * offset,
                             )
+                            center_was_flipped = True
                             classifier.Perform(center, 1e-4)
                             if classifier.State() == TopAbs_IN:
                                 continue
 
-                    outward_dir = gp_Vec(normal.X(), normal.Y(), normal.Z())
-                    outward_dir.Multiply(-inward_sign)
+                    # Calculate outward direction, accounting for flip
+                    if center_was_flipped:
+                        outward_dir = gp_Vec(normal.X(), normal.Y(), normal.Z())
+                        outward_dir.Multiply(inward_sign)
+                    else:
+                        outward_dir = gp_Vec(normal.X(), normal.Y(), normal.Z())
+                        outward_dir.Multiply(-inward_sign)
+                    
                     face_positions.append((center, radius, outward_dir))
                     total_placed += 1
 
