@@ -115,14 +115,14 @@ class ProcessingThread(QThread):
             density = self.density  # 0.0-1.0
             
             # Convert density to spheres_per_mm2
-            # Density 0.8 should map to roughly 0.15 spheres/mm2 for good coverage
-            # Scale: 0.0 → 0.0, 0.5 → 0.1, 0.8 → 0.15, 1.0 → 0.2
-            spheres_per_mm2 = density * 0.2
+            # Scale density slightly higher for fuller stipple coverage
+            # while preserving UI behavior: 0.0 → 0.0, 0.5 → 0.12,
+            # 0.8 → 0.192, 1.0 → 0.24
+            spheres_per_mm2 = density * 0.24
             
             # Stencil approach parameters
             strip_count = 8  # Number of strips to divide geometry
             overlap = 0.3  # 30% overlap between strips
-            batch_size = 10  # Spheres per boolean cut — max ~10 for reliable OCP output
             
             def on_status(msg: str):
                 if self.is_cancelled():
@@ -151,7 +151,6 @@ class ProcessingThread(QThread):
                 spheres_per_mm2=spheres_per_mm2,
                 strip_count=strip_count,
                 overlap=overlap,
-                batch_size=batch_size,
                 size_variation=True,  # Add variety in hole sizes (0.5x to 1.5x radius)
                 status_callback=on_status,
                 cancel_callback=on_cancel_check,

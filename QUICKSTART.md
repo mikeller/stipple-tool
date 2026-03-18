@@ -88,7 +88,6 @@ INSTALLATION.md      - Setup guide
 ✓ Apply customizable stippling patterns  
 ✓ Export modified models to STEP format  
 ✓ Interactive GUI with real-time preview  
-✓ Batch processing support  
 
 ## Stippling Parameters
 

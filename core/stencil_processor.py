@@ -16,8 +16,9 @@ intersections are resolved reliably.
 
 import random
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.BRep import BRep_Tool
@@ -30,7 +31,7 @@ from OCP.TopAbs import TopAbs_FACE, TopAbs_IN, TopAbs_SOLID
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopTools import TopTools_ListOfShape
-from OCP.TopoDS import TopoDS, TopoDS_Shape
+from OCP.TopoDS import TopoDS, TopoDS_Builder, TopoDS_Compound, TopoDS_Shape
 from OCP.gp import gp_Pnt, gp_Vec
 
 from core.color_analyzer import ColorAnalyzer
@@ -48,27 +49,46 @@ class StencilStippleProcessor:
         shape: TopoDS_Shape,
         emit_status: Callable[[str], None],
     ) -> TopoDS_Shape:
-        """Heal only when needed to avoid introducing artifacts."""
+        """Heal and fix orientation of shape before export."""
         try:
             from OCP.BRepCheck import BRepCheck_Analyzer
+            from OCP.ShapeFix import ShapeFix_Shape, ShapeFix_Solid
 
-            analyzer = BRepCheck_Analyzer(shape, True)
-            if analyzer.IsValid():
+            # Always fix solid face orientation, even on topologically valid shapes.
+            # BRepCheck_Analyzer reports "valid" for shapes that still have inverted
+            # face normals (pointing inward), which FreeCAD renders as transparent
+            # surfaces or convex protrusions instead of concave stipple dimples.
+            try:
+                sf = ShapeFix_Solid(TopoDS.Solid_s(shape))
+                sf.Perform()
+                oriented = sf.Solid()
+                if oriented is not None and not oriented.IsNull():
+                    shape = oriented
+            except Exception:
+                pass  # shape may be a compound; orientation fix is best-effort
+
+            # If now valid, no further healing needed.
+            pre_analyzer = BRepCheck_Analyzer(shape, True)
+            if pre_analyzer.IsValid():
                 return shape
-        except Exception:
-            return shape
 
-        try:
-            from OCP.ShapeFix import ShapeFix_Shape
-
-            emit_status("Healing final shape for export...")
+            # Full healing pass for shapes still reporting errors.
+            emit_status("Healing and fixing shape orientation...")
             healer = ShapeFix_Shape()
             healer.Init(shape)
             healer.SetPrecision(1e-5)
             healer.SetMaxTolerance(0.1)
             healer.SetMinTolerance(1e-6)
             healer.Perform()
-            return healer.Shape()
+            healed = healer.Shape()
+
+            analyzer = BRepCheck_Analyzer(healed, True)
+            if not analyzer.IsValid():
+                emit_status("Warning: Shape still invalid after healing")
+                emit_status("Healing did not improve validity; keeping original shape")
+                return shape
+
+            return healed
         except Exception as e:
             emit_status(f"Healing encountered issue: {e} (using original)")
             return shape
@@ -89,26 +109,148 @@ class StencilStippleProcessor:
         except Exception:
             return 0
 
+    def _largest_solid_component(
+        self, shape: TopoDS_Shape
+    ) -> Tuple[Optional[TopoDS_Shape], float, float, int]:
+        """Return largest solid, its volume, total solids volume, and count."""
+        try:
+            largest_solid = None
+            largest_volume = 0.0
+            total_volume = 0.0
+            solid_count = 0
+
+            explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+            while explorer.More():
+                solid = TopoDS.Solid_s(explorer.Current())
+                props = GProp_GProps()
+                BRepGProp.VolumeProperties_s(solid, props)
+                vol = abs(props.Mass())
+                total_volume += vol
+                solid_count += 1
+                if vol > largest_volume:
+                    largest_volume = vol
+                    largest_solid = solid
+                explorer.Next()
+
+            return largest_solid, largest_volume, total_volume, solid_count
+        except Exception:
+            return None, 0.0, 0.0, 0
+
+    def _solid_contains_point(self, solid: TopoDS_Shape, point: gp_Pnt) -> bool:
+        """Check whether a point lies inside a solid."""
+        try:
+            classifier = BRepClass3d_SolidClassifier(TopoDS.Solid_s(solid))
+            classifier.Perform(point, 1e-4)
+            return classifier.State() == TopAbs_IN
+        except Exception:
+            return False
+
+    def _select_main_solid_component(
+        self, shape: TopoDS_Shape, reference_point: Optional[gp_Pnt]
+    ) -> Tuple[Optional[TopoDS_Shape], float, float, int]:
+        """Select main solid component using a stable interior reference point.
+
+        Returns (selected_solid, selected_volume, total_volume, solid_count).
+        """
+        try:
+            solids: List[Tuple[TopoDS_Shape, float]] = []
+            total_volume = 0.0
+            explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+            while explorer.More():
+                solid = TopoDS.Solid_s(explorer.Current())
+                props = GProp_GProps()
+                BRepGProp.VolumeProperties_s(solid, props)
+                vol = abs(props.Mass())
+                solids.append((solid, vol))
+                total_volume += vol
+                explorer.Next()
+
+            if not solids:
+                return None, 0.0, 0.0, 0
+
+            if reference_point is not None:
+                for solid, vol in solids:
+                    if self._solid_contains_point(solid, reference_point):
+                        return solid, vol, total_volume, len(solids)
+
+            solid, vol = max(solids, key=lambda item: item[1])
+            return solid, vol, total_volume, len(solids)
+        except Exception:
+            return None, 0.0, 0.0, 0
+
+    def _extract_solids_only_shape(
+        self,
+        shape: TopoDS_Shape,
+        reference_point: Optional[gp_Pnt],
+    ) -> Optional[TopoDS_Shape]:
+        """Drop detached sheets/shells by rebuilding the shape from solids only.
+
+        If there is one solid, return it directly. If there are multiple solids,
+        prefer the solid containing the reference interior point; otherwise use
+        the largest solid. This is intentionally conservative because the target
+        output is a single stippled part, not a mixed solid+sheet compound.
+        """
+        try:
+            solids: List[TopoDS_Shape] = []
+            explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+            while explorer.More():
+                solids.append(TopoDS.Solid_s(explorer.Current()))
+                explorer.Next()
+
+            if not solids:
+                return None
+
+            if len(solids) == 1:
+                return solids[0]
+
+            selected_solid, _, _, _ = self._select_main_solid_component(
+                shape, reference_point
+            )
+            if selected_solid is not None:
+                return selected_solid
+
+            return solids[0]
+        except Exception:
+            return None
+
+    def _is_shape_valid(self, shape: TopoDS_Shape) -> bool:
+        """Return True when OCC reports a topologically valid shape."""
+        try:
+            from OCP.BRepCheck import BRepCheck_Analyzer
+
+            analyzer = BRepCheck_Analyzer(shape, True)
+            return bool(analyzer.IsValid())
+        except Exception:
+            # If validation itself fails, do not block processing.
+            return True
+
     def process_step_with_stencil_stippling(
         self,
         step_file: str,
         output_path: str,
         target_color: str,
         sphere_radius: float = 1.0,
-        sphere_depth: float = 0.5,
-        spheres_per_mm2: float = 0.12,
+        sphere_depth: float = 0.45,
+        spheres_per_mm2: float = 0.34,
         strip_count: int = 6,
         overlap: float = 0.2,
-        batch_size: int = 10,
         size_variation: bool = True,
-        size_variation_mode: str = "uniform",
-        size_variation_sigma: float = 0.2,
-        size_variation_min: float = 0.7,
-        size_variation_max: float = 1.3,
+        size_variation_mode: str = "gaussian",
+        size_variation_sigma: float = 0.25,
+        size_variation_min: float = 0.60,
+        size_variation_max: float = 1.6,
+        face_order_strategy: str = "largest_first",
+        seed_spheres_per_face: int = 20,
+        debug_log_path: Optional[str] = None,
         status_callback: Optional[Callable] = None,
         cancel_callback: Optional[Callable] = None,
     ) -> Optional[str]:
+        status_log_lines: List[str] = []
+
         def emit_status(msg: str):
+            timestamped = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+            if debug_log_path:
+                status_log_lines.append(timestamped)
             if status_callback:
                 status_callback(msg)
             else:
@@ -137,6 +279,7 @@ class StencilStippleProcessor:
 
             # Extract target face objects and their centroids
             target_faces_data = []  # [(face_obj, centroid, area), ...]
+            target_face_ids: List[int] = []
             explorer = TopExp_Explorer(loader.shape, TopAbs_FACE)
             face_idx = 0
             while explorer.More():
@@ -147,6 +290,7 @@ class StencilStippleProcessor:
                     centroid = props.CentreOfMass()
                     area = props.Mass()
                     target_faces_data.append((face, (centroid.X(), centroid.Y(), centroid.Z()), area))
+                    target_face_ids.append(face_idx)
                 explorer.Next()
                 face_idx += 1
 
@@ -200,240 +344,458 @@ class StencilStippleProcessor:
                 f"{len(face_groups)} faces"
             )
 
-            # Phase 2: Individual fuzzy boolean cuts, face by face.
+            # Phase 2: Batched boolean cuts per face.
             #
-            # Process spheres in face order (not shuffled) so every
-            # face gets at least some coverage before the shape becomes
-            # too complex.  Each cut.Build() runs in a thread with a
-            # timeout.  An escalation detector stops processing when
-            # average cut time exceeds a threshold — this prevents the
-            # tool from hanging indefinitely as accumulated complexity
-            # makes each subsequent boolean operation slower.
+            # We batch all spheres for each face into an OCC compound
+            # and cut them in one boolean operation, reducing ~5000 ops
+            # to ~165 (one per face).  This avoids O(n²) complexity
+            # accumulation that slows and eventually corrupts the shape.
             emit_status("Cutting spheres...")
             cut_start = time.time()
             current_shape = parent_solid if parent_solid else loader.shape
+            last_valid_shape = current_shape
             applied = 0
             skipped = 0
-            timed_out = 0
 
             # Measure initial volume
             init_props = GProp_GProps()
             BRepGProp.VolumeProperties_s(current_shape, init_props)
             current_volume = abs(init_props.Mass())
             initial_volume = current_volume
+            reference_inside_point = init_props.CentreOfMass()
 
-            # Flatten face_groups into ordered list, interleaving faces
-            # so early cuts are distributed across all faces
-            max_face_len = max(len(g) for g in face_groups)
-            ordered_positions: List[Tuple[gp_Pnt, float, gp_Vec]] = []
-            for slot in range(max_face_len):
-                for group in face_groups:
-                    if slot < len(group):
-                        ordered_positions.append(group[slot])
+            # Phase 2: Batched boolean cuts per face.
+            #
+            # Instead of cutting spheres one-by-one (which accumulates
+            # topological complexity O(n²) and eventually corrupts the
+            # shape), we batch all spheres for each face into a single
+            # OCC compound and cut them in one boolean operation.
+            # This reduces ~5000 boolean ops to ~165 (one per face),
+            # dramatically improving speed and eliminating accumulated
+            # corruption.  If a batch fails, it is split in half and
+            # retried recursively down to a minimum batch size.
 
-            total = len(ordered_positions)
-            report_interval = max(1, total // 20)
+            face_stats: Dict[int, Dict[str, float]] = {}
+            skip_reasons = Counter()
+            total = sum(len(g) for g in face_groups)
 
-            # Per-cut timeout
-            cut_timeout = 15.0  # seconds
-            # Escalation detection
-            recent_times: List[float] = []
-            max_recent = 10
-            escalation_threshold = 10.0  # Increased for deeper cuts (0.5mm depth)
-            consecutive_timeouts = 0
-            max_consecutive_timeouts = 5
-            # Consecutive validation failures — stop when no cuts succeed
-            consecutive_validation_fails = 0
-            max_consecutive_validation_fails = 150  # Try harder
-            # Adaptive back-off for repeated failures
-            global_scale = 1.0
-            min_global_scale = 0.4  # Back off more aggressively
-            backoff_trigger = 40  # More permissive before backing off
-            backoff_factor = 0.85  # Smaller steps preserve more geometry
+            # Build face processing order. Prioritizing larger groups tends to
+            # hit harder/larger regions earlier; a small seed pass can preserve
+            # minimum coverage across all faces when runtime budget is tight.
+            face_entries = []
+            for group_index, group in enumerate(face_groups):
+                face_id = (
+                    target_face_ids[group_index]
+                    if group_index < len(target_face_ids)
+                    else group_index
+                )
+                face_entries.append((group_index, int(face_id), group))
 
-            if size_variation and size_variation_mode == "gaussian":
-                max_sphere_radius = sphere_radius * size_variation_max
+            if face_order_strategy == "smallest_first":
+                face_entries.sort(key=lambda item: len(item[2]))
+            elif face_order_strategy == "original":
+                pass
             else:
-                max_sphere_radius = sphere_radius * (1.4 if size_variation else 1.0)
-            max_single_sphere_vol = (
-                (4.0 / 3.0) * 3.14159 * max_sphere_radius ** 3
+                face_entries.sort(key=lambda item: len(item[2]), reverse=True)
+
+            seed_count = max(0, int(seed_spheres_per_face))
+            if seed_count > 0:
+                seeded_entries = []
+                remainder_entries = []
+                for group_index, face_id, group in face_entries:
+                    if len(group) <= seed_count:
+                        seeded_entries.append((group_index, face_id, group))
+                        continue
+                    seeded_entries.append((group_index, face_id, group[:seed_count]))
+                    remainder_entries.append((group_index, face_id, group[seed_count:]))
+                face_entries = seeded_entries + remainder_entries
+                emit_status(
+                    f"Face ordering: {face_order_strategy}, seed pass {seed_count} spheres/face"
+                )
+            else:
+                emit_status(f"Face ordering: {face_order_strategy}")
+
+            # Hard runtime budget to guarantee completion.
+            max_cut_runtime_seconds = (
+                24 * 3600 if spheres_per_mm2 >= 0.40 else 18 * 3600
             )
 
+            # Initialize per-face stats
+            for group_index, face_id, group in face_entries:
+                if group_index not in face_stats:
+                    face_stats[group_index] = {
+                        "face_id": face_id,
+                        "planned": len(group),
+                        "applied": 0,
+                        "skipped": 0,
+                        "timeouts": 0,
+                    }
+                else:
+                    face_stats[group_index]["planned"] += len(group)
+
+            # Per-face: largest batch size that succeeded (seed pass → hint for remainder).
+            face_seed_max_success: Dict[int, int] = {}
+            # Map group_index → original face data for fresh-position retries.
+            origin_face_data_map = {
+                i: target_faces_data[i] for i in range(len(target_faces_data))
+            }
+
             executor = ThreadPoolExecutor(max_workers=1)
+            interrupted = False
+            timed_out = 0
+
+            def _make_compound(
+                positions: List[Tuple[gp_Pnt, float, gp_Vec]],
+            ) -> TopoDS_Compound:
+                """Build a compound shape from a list of sphere positions."""
+                builder = TopoDS_Builder()
+                compound = TopoDS_Compound()
+                builder.MakeCompound(compound)
+                for centre, r, _ in positions:
+                    builder.Add(
+                        compound,
+                        BRepPrimAPI_MakeSphere(centre, r).Shape(),
+                    )
+                return compound
+
+            def _try_batch_cut(
+                shape: TopoDS_Shape,
+                compound: TopoDS_Compound,
+                timeout_s: float,
+            ) -> Optional[TopoDS_Shape]:
+                """Cut compound from shape with timeout.  Returns result or None."""
+                nonlocal executor
+                try:
+                    cut = BRepAlgoAPI_Cut()
+                    a = TopTools_ListOfShape()
+                    a.Append(shape)
+                    cut.SetArguments(a)
+                    t = TopTools_ListOfShape()
+                    t.Append(compound)
+                    cut.SetTools(t)
+                    cut.SetFuzzyValue(0.01)
+
+                    future = executor.submit(cut.Build)
+                    try:
+                        future.result(timeout=timeout_s)
+                    except FutureTimeout:
+                        executor.shutdown(wait=False)
+                        executor = ThreadPoolExecutor(max_workers=1)
+                        return None
+
+                    if cut.IsDone() and not cut.Shape().IsNull():
+                        return cut.Shape()
+                except Exception:
+                    pass
+                return None
+
+            def _validate_batch_result(
+                result: Optional[TopoDS_Shape],
+                prev_volume: float,
+                batch_positions: List[Tuple[gp_Pnt, float, gp_Vec]],
+            ) -> Tuple[Optional[TopoDS_Shape], float]:
+                """Validate a batch cut result.
+
+                Returns (accepted_shape, new_volume) or (None, 0) on rejection.
+                """
+                if result is None:
+                    return None, 0.0
+
+                vp = GProp_GProps()
+                BRepGProp.VolumeProperties_s(result, vp)
+                new_vol = abs(vp.Mass())
+
+                # Shape destroyed
+                if new_vol < 1e-3:
+                    return None, 0.0
+                # Volume increased — boolean corruption
+                if new_vol > prev_volume * 1.001:
+                    return None, 0.0
+
+                removed = prev_volume - new_vol
+                # Guard against unstable boolean outcomes that effectively add
+                # material. A tiny negative value can be numerical noise.
+                if removed < -0.05:
+                    return None, 0.0
+                # Guard against zero-intersection cuts that produce only a
+                # circular seam curve (circle-only artifact) without actually
+                # removing any cap material.
+                if removed < 0.001:
+                    return None, 0.0
+                # Sanity: removal should not vastly exceed the total sphere
+                # volume (with generous 3x headroom for partial overlaps and
+                # thin-wall merging).
+                total_sphere_vol = sum(
+                    (4.0 / 3.0) * 3.14159 * r ** 3
+                    for _, r, _ in batch_positions
+                )
+                if total_sphere_vol > 0 and removed > total_sphere_vol * 3.0:
+                    return None, 0.0
+
+                # Handle split solids
+                solid_count = self._count_solid_components(result)
+                if solid_count > 1:
+                    largest, largest_vol, total_vol, _ = (
+                        self._select_main_solid_component(
+                            result, reference_inside_point
+                        )
+                    )
+                    if (
+                        largest is not None
+                        and total_vol > 0
+                        and (largest_vol / total_vol) >= 0.90
+                    ):
+                        return largest, largest_vol
+
+                    # Solid split without a dominant component — reject the
+                    # batch so it gets split or retried with fresh positions.
+                    # clip_to_boundary was removed here: the BRepAlgoAPI_Common
+                    # it used produced stray sheet geometry and impossible volume
+                    # anomalies (see v6/v7 run notes).
+                    return None, 0.0
+
+                return result, new_vol
+
+            def _try_fresh_cut(
+                g_index: int,
+                n: int,
+                timeout_s: float,
+                reason: str,
+                max_retries: int = 3,
+            ) -> int:
+                """Retry a small batch with freshly sampled sphere positions.
+
+                Returns the number of spheres successfully applied (0 on total failure).
+                Each retry independently regenerates n random positions for the face
+                so a bad placement cluster can be avoided.
+                """
+                nonlocal current_shape, current_volume, last_valid_shape
+                face_data = origin_face_data_map.get(g_index)
+                if face_data is None:
+                    return 0
+                for attempt in range(max_retries):
+                    try:
+                        fresh_groups = self._generate_sphere_positions_on_faces(
+                            [face_data],
+                            n,
+                            sphere_radius,
+                            sphere_depth,
+                            size_variation,
+                            size_variation_mode,
+                            size_variation_sigma,
+                            size_variation_min,
+                            size_variation_max,
+                            parent_solid,
+                        )
+                    except Exception:
+                        continue
+                    if not fresh_groups or not fresh_groups[0]:
+                        continue
+                    fresh_batch = fresh_groups[0][:n]
+                    fresh_compound = _make_compound(fresh_batch)
+                    fresh_result = _try_batch_cut(
+                        current_shape, fresh_compound, timeout_s
+                    )
+                    if fresh_result is None:
+                        continue
+                    fv_shape, fv_vol = _validate_batch_result(
+                        fresh_result, current_volume, fresh_batch
+                    )
+                    if fv_shape is None:
+                        continue
+                    removed_f = current_volume - fv_vol
+                    current_shape = fv_shape
+                    current_volume = fv_vol
+                    if self._count_solid_components(current_shape) >= 1:
+                        last_valid_shape = current_shape
+                    emit_status(
+                        f"    Fresh-retry {attempt + 1}/{max_retries}: "
+                        f"{len(fresh_batch)} spheres ok "
+                        f"(removed {removed_f:.2f} mm³, was {reason})"
+                    )
+                    return len(fresh_batch)
+                return 0
+
+            # Minimum batch size below which we stop splitting and switch to
+            # fresh-position retries. Keeping this at 5 avoids deep split cascades.
+            min_batch_size = 5
+
+            # Per-face guardrails to prevent pathological runs from appearing hung.
+            max_face_runtime_seconds = 900.0
+            max_face_consecutive_failures = 40
 
             try:
-                for i, (centre, radius, outward_dir) in enumerate(ordered_positions):
+                for group_index, face_id, group in face_entries:
                     check_cancel()
 
-                    t0 = time.time()
-                    try:
-                        attempt_scales = (1.0, 0.85, 0.7)
-                        success = False
-                        timed_out_this_cut = False
+                    elapsed = time.time() - cut_start
+                    if elapsed >= max_cut_runtime_seconds:
+                        emit_status(
+                            f"  Runtime budget reached ({elapsed:.0f}s) "
+                            f"— stopping at {applied} spheres"
+                        )
+                        break
 
-                        for scale in attempt_scales:
-                            attempt_radius = radius * global_scale * scale
-                            if attempt_radius <= 0:
-                                continue
+                    if not group:
+                        continue
 
-                            sphere = BRepPrimAPI_MakeSphere(
-                                centre, attempt_radius
-                            ).Shape()
+                    face_count = len(group)
+                    face_start = time.time()
 
-                            cut = BRepAlgoAPI_Cut()
-                            args = TopTools_ListOfShape()
-                            args.Append(current_shape)
-                            cut.SetArguments(args)
-                            tools = TopTools_ListOfShape()
-                            tools.Append(sphere)
-                            cut.SetTools(tools)
-                            cut.SetFuzzyValue(0.01)
+                    emit_status(
+                        f"  Face {face_id}: cutting {face_count} spheres "
+                        f"as batch..."
+                    )
 
-                            future = executor.submit(cut.Build)
-                            try:
-                                future.result(timeout=cut_timeout)
-                            except FutureTimeout:
-                                timed_out += 1
-                                consecutive_timeouts += 1
-                                dt = time.time() - t0
-                                emit_status(
-                                    f"  Sphere {i+1}: timed out ({dt:.1f}s)"
-                                )
-                                executor.shutdown(wait=False)
-                                executor = ThreadPoolExecutor(max_workers=1)
-                                timed_out_this_cut = True
-                                if consecutive_timeouts >= max_consecutive_timeouts:
-                                    emit_status(
-                                        f"  {max_consecutive_timeouts} "
-                                        f"consecutive timeouts — stopping"
-                                    )
-                                    break
-                                break
+                    # Queue-based adaptive splitting.
+                    # If this face had a successful batch size in the seed pass,
+                    # pre-chunk the remainder at that size to skip the expensive
+                    # halving cascade that would otherwise start at the full group.
+                    _hint = face_seed_max_success.get(group_index, len(group))
+                    if 0 < _hint < len(group):
+                        queue = [
+                            group[i : i + _hint]
+                            for i in range(0, len(group), _hint)
+                        ]
+                        # Avoid tiny trailing chunks (e.g. 2-4) from pre-chunking,
+                        # which correlate with circle-only/degenerate local artifacts.
+                        # Merge remainder into previous chunk so downstream logic
+                        # only sees robust batch sizes or min-batch fresh retries.
+                        if len(queue) > 1 and len(queue[-1]) < min_batch_size:
+                            queue[-2].extend(queue[-1])
+                            queue.pop()
+                    else:
+                        queue = [group]
+                    face_applied = 0
+                    face_timed_out = 0
+                    face_consecutive_failures = 0
 
-                            consecutive_timeouts = 0
+                    while queue:
+                        check_cancel()
 
-                            if cut.IsDone() and not cut.Shape().IsNull():
-                                result = cut.Shape()
+                        elapsed = time.time() - cut_start
+                        if elapsed >= max_cut_runtime_seconds:
+                            break
 
-                                # Volume validation: ensure the cut didn't
-                                # produce degenerate geometry
-                                vp = GProp_GProps()
-                                BRepGProp.VolumeProperties_s(result, vp)
-                                new_vol = abs(vp.Mass())
+                        face_elapsed = time.time() - face_start
+                        if face_elapsed >= max_face_runtime_seconds:
+                            skip_reasons["face_runtime_guard"] += len(queue)
+                            emit_status(
+                                f"    Face {face_id}: runtime guard hit "
+                                f"({face_elapsed:.0f}s) - skipping remaining batches"
+                            )
+                            break
 
-                                if new_vol < 1e-3:
-                                    continue
-                                if new_vol > current_volume * 1.001:
-                                    continue
-                                removed_vol = current_volume - new_vol
-                                if removed_vol <= 0:
-                                    continue
-                                
-                                # Validation threshold: stricter only for extremely shallow cuts
-                                # that indicate barely-touching geometry (< 0.5% of sphere volume).
-                                # Don't tie this to backoff state to avoid feedback loops.
-                                sphere_volume = (4.0 / 3.0) * 3.14159 * attempt_radius ** 3
-                                if removed_vol < sphere_volume * 0.005:
-                                    # Extremely shallow cut - likely a barely-touching or
-                                    # malformed sphere, use strict threshold
-                                    min_cut_vol = sphere_volume * 0.005
-                                else:
-                                    # Normal cut depth, use permissive threshold
-                                    min_cut_vol = sphere_volume * 0.002
-                                    
-                                if removed_vol < min_cut_vol:
-                                    continue
-                                if removed_vol > max_single_sphere_vol * 3:
-                                    continue
+                        if face_consecutive_failures >= max_face_consecutive_failures:
+                            skip_reasons["face_failure_guard"] += len(queue)
+                            emit_status(
+                                f"    Face {face_id}: failure guard hit "
+                                f"({face_consecutive_failures} consecutive) - "
+                                f"skipping remaining batches"
+                            )
+                            break
 
-                                # Reject if boolean cut created disconnected solids
-                                # (isolated "filled" geometry around the cut area)
-                                solid_count = self._count_solid_components(result)
-                                if solid_count > 1:
-                                    continue
-
-                                # Strict validation: the outward sphere cap
-                                # must be outside the resulting solid.
-                                if outward_dir.Magnitude() > 1e-6:
-                                    outward_dir.Normalize()
-                                    probe = gp_Pnt(
-                                        centre.X() + outward_dir.X() * attempt_radius,
-                                        centre.Y() + outward_dir.Y() * attempt_radius,
-                                        centre.Z() + outward_dir.Z() * attempt_radius,
-                                    )
-                                    try:
-                                        post_classifier = BRepClass3d_SolidClassifier(result)
-                                        post_classifier.Perform(probe, 1e-4)
-                                        if post_classifier.State() == TopAbs_IN:
-                                            continue
-                                    except Exception:
-                                        continue
-
-                                current_shape = result
-                                current_volume = new_vol
-                                applied += 1
-                                consecutive_validation_fails = 0
-                                success = True
-                                break
-
-                        if timed_out_this_cut:
-                            if consecutive_timeouts >= max_consecutive_timeouts:
-                                break
+                        batch = queue.pop(0)
+                        if not batch:
                             continue
 
-                        if not success:
-                            skipped += 1
-                            consecutive_validation_fails += 1
-                    except Exception:
-                        skipped += 1
-                        consecutive_validation_fails += 1
+                        compound = _make_compound(batch)
+                        batch_timeout = max(120.0, len(batch) * 2.0)
 
-                    if (consecutive_validation_fails
-                            >= backoff_trigger
-                            and global_scale > min_global_scale):
-                        global_scale *= backoff_factor
-                        if global_scale < min_global_scale:
-                            global_scale = min_global_scale
-                        emit_status(
-                            f"  Back-off: reducing sphere scale to "
-                            f"{global_scale:.2f}"
+                        t0 = time.time()
+                        result = _try_batch_cut(
+                            current_shape, compound, batch_timeout
                         )
-                        consecutive_validation_fails = 0
-                    elif (consecutive_validation_fails
-                            >= max_consecutive_validation_fails):
-                        emit_status(
-                            f"  {max_consecutive_validation_fails} "
-                            f"consecutive failed cuts — shape too "
-                            f"complex, stopping at {applied} spheres"
-                        )
-                        break
+                        dt = time.time() - t0
 
-                    dt = time.time() - t0
-                    recent_times.append(dt)
-                    if len(recent_times) > max_recent:
-                        recent_times.pop(0)
+                        if result is None:
+                            # Timed out or failed
+                            face_timed_out += len(batch)
+                            face_consecutive_failures += 1
+                            if len(batch) >= 2 * min_batch_size:
+                                mid = len(batch) // 2
+                                queue.append(batch[:mid])
+                                queue.append(batch[mid:])
+                                emit_status(
+                                    f"    Batch of {len(batch)} failed/timed-out "
+                                    f"({dt:.1f}s) — splitting"
+                                )
+                            else:
+                                placed = _try_fresh_cut(
+                                    group_index, len(batch), batch_timeout,
+                                    "timed-out",
+                                )
+                                if placed > 0:
+                                    face_applied += placed
+                                    face_consecutive_failures = 0
+                                else:
+                                    skip_reasons["batch_failed"] += len(batch)
+                            continue
 
-                    # Escalation detection
-                    if (len(recent_times) == max_recent
-                            and sum(recent_times) / max_recent
-                            > escalation_threshold):
-                        avg = sum(recent_times) / max_recent
-                        emit_status(
-                            f"  Cuts slowing (avg {avg:.1f}s/cut) — "
-                            f"stopping at {applied} spheres"
+                        valid_shape, new_vol = _validate_batch_result(
+                            result, current_volume, batch
                         )
-                        break
 
-                    # Progress
-                    if (i + 1) % report_interval == 0 or i == total - 1:
-                        elapsed = time.time() - cut_start
-                        rate = (i + 1) / elapsed if elapsed > 0 else 0
-                        eta = (total - i - 1) / rate if rate > 0 else 0
+                        if valid_shape is None:
+                            # Validation failed — split and retry
+                            face_consecutive_failures += 1
+                            if len(batch) >= 2 * min_batch_size:
+                                mid = len(batch) // 2
+                                queue.append(batch[:mid])
+                                queue.append(batch[mid:])
+                                emit_status(
+                                    f"    Batch of {len(batch)} failed validation "
+                                    f"({dt:.1f}s) — splitting"
+                                )
+                            else:
+                                placed = _try_fresh_cut(
+                                    group_index, len(batch), batch_timeout,
+                                    "validation",
+                                )
+                                if placed > 0:
+                                    face_applied += placed
+                                    face_consecutive_failures = 0
+                                else:
+                                    skip_reasons["batch_validation"] += len(batch)
+                            continue
+
+                        # Batch accepted
+                        removed = current_volume - new_vol
+                        current_shape = valid_shape
+                        current_volume = new_vol
+                        face_applied += len(batch)
+                        face_consecutive_failures = 0
+                        # Record largest success for this face (used as pre-chunk hint).
+                        if len(batch) > face_seed_max_success.get(group_index, 0):
+                            face_seed_max_success[group_index] = len(batch)
                         emit_status(
-                            f"  Sphere {i+1}/{total} "
-                            f"({applied} ok, {skipped} skip) "
-                            f"[{elapsed:.0f}s, ~{eta:.0f}s left]"
+                            f"    Batch of {len(batch)} ok ({dt:.1f}s, "
+                            f"removed {removed:.2f} mm³)"
                         )
+
+                    applied += face_applied
+                    face_skipped = face_count - face_applied
+                    skipped += face_skipped
+                    face_stats[group_index]["applied"] += face_applied
+                    face_stats[group_index]["skipped"] += face_skipped
+                    face_stats[group_index]["timeouts"] += face_timed_out
+                    timed_out += face_timed_out
+
+                    elapsed = time.time() - cut_start
+                    emit_status(
+                        f"  Face {face_id}: {face_applied}/{face_count} applied "
+                        f"[{elapsed:.0f}s elapsed, {applied} total]"
+                    )
+
+                    # Persist a known-good checkpoint for final export fallback.
+                    if face_applied > 0 and self._count_solid_components(current_shape) >= 1:
+                        last_valid_shape = current_shape
+
+            except KeyboardInterrupt:
+                interrupted = True
+                emit_status(
+                    "  Interrupted by user — finalizing partial result"
+                )
             finally:
                 executor.shutdown(wait=False)
 
@@ -453,44 +815,103 @@ class StencilStippleProcessor:
                 + (f" ({timed_out} timed out)" if timed_out else "")
                 + f" in {cut_time:.1f}s"
             )
+            if interrupted:
+                emit_status("Run ended early due to user interrupt.")
             emit_status(
                 f"Volume: {initial_volume:.1f} → {final_volume:.1f} mm³ "
                 f"(removed {removed:.1f} mm³, "
                 f"{removed/initial_volume*100:.2f}%)"
             )
 
+            if debug_log_path:
+                coverage_lines = []
+                for stats in face_stats.values():
+                    planned = int(stats["planned"])
+                    applied_face = int(stats["applied"])
+                    skipped_face = int(stats["skipped"])
+                    coverage_pct = (
+                        (applied_face / planned) * 100.0 if planned > 0 else 0.0
+                    )
+                    coverage_lines.append(
+                        (
+                            coverage_pct,
+                            f"face={int(stats['face_id'])} "
+                            f"planned={planned} applied={applied_face} "
+                            f"skipped={skipped_face} "
+                            f"timeouts={int(stats['timeouts'])} "
+                            f"coverage={coverage_pct:.1f}%"
+                        )
+                    )
+
+                low_coverage = [line for cov, line in coverage_lines if cov < 50.0]
+                zero_coverage = [line for cov, line in coverage_lines if cov == 0.0]
+
+                summary_lines = [
+                    "",
+                    "===== DEBUG SUMMARY =====",
+                    f"input={step_file}",
+                    f"output={output_path}",
+                    f"target_faces={len(face_groups)}",
+                    f"total_spheres={total}",
+                    f"applied={applied}",
+                    f"skipped={skipped}",
+                    f"timed_out={timed_out}",
+                    f"cut_time_seconds={cut_time:.1f}",
+                    f"volume_removed_percent={removed/initial_volume*100:.4f}",
+                    "",
+                    "Top skip reasons:",
+                ]
+                for reason, count in skip_reasons.most_common(15):
+                    summary_lines.append(f"- {reason}: {count}")
+
+                summary_lines.append("")
+                summary_lines.append(
+                    f"Faces with zero coverage ({len(zero_coverage)}):"
+                )
+                summary_lines.extend(f"- {line}" for line in zero_coverage[:50])
+
+                summary_lines.append("")
+                summary_lines.append(
+                    f"Faces with coverage <50% ({len(low_coverage)}):"
+                )
+                summary_lines.extend(f"- {line}" for line in low_coverage[:100])
+
+                summary_lines.append("")
+                summary_lines.append("Per-face coverage:")
+                for _, line in sorted(coverage_lines, key=lambda x: x[0]):
+                    summary_lines.append(f"- {line}")
+
+                with open(debug_log_path, "w", encoding="utf-8") as debug_file:
+                    if status_log_lines:
+                        debug_file.write("\n".join(status_log_lines))
+                        debug_file.write("\n")
+                    debug_file.write("\n".join(summary_lines))
+                    debug_file.write("\n")
+
+                emit_status(f"Debug log saved: {debug_log_path}")
+
+            solids_only_shape = self._extract_solids_only_shape(
+                current_shape,
+                reference_inside_point,
+            )
+            if solids_only_shape is not None:
+                current_shape = solids_only_shape
+
             current_shape = self._heal_shape_for_export(
                 current_shape,
                 emit_status,
             )
 
+            if not self._is_shape_valid(current_shape):
+                emit_status("Final shape invalid after healing, reverting to last valid checkpoint")
+                if self._is_shape_valid(last_valid_shape):
+                    current_shape = last_valid_shape
+
             # Save final shape
             emit_status(f"Saving result: {output_path}")
-            
-            # Clean up the shape before saving to STEP
-            # Remove any degenerate edges/faces that might appear as artifacts
-            try:
-                from OCP.BRepCheck import BRepCheck_Analyzer
-                from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
-                
-                # Make a clean copy first
-                copy_builder = BRepBuilderAPI_Copy(current_shape)
-                clean_shape = copy_builder.Shape()
-                
-                # Check if healing is needed
-                analyzer = BRepCheck_Analyzer(clean_shape, True)
-                if not analyzer.IsValid():
-                    emit_status("Validating shape for STEP export...")
-                    clean_shape = self._heal_shape_for_export(clean_shape, emit_status)
-                
-                if not loader.save_step(output_path, clean_shape):
-                    emit_status("Failed to write final STEP")
-                    return None
-            except Exception as e:
-                emit_status(f"Shape cleanup warning: {e}, saving anyway")
-                if not loader.save_step(output_path, current_shape):
-                    emit_status("Failed to write final STEP")
-                    return None
+            if not loader.save_step(output_path, current_shape):
+                emit_status("Failed to write final STEP")
+                return None
 
             emit_status("✓ Stencil stippling complete")
             return output_path
@@ -591,6 +1012,33 @@ class StencilStippleProcessor:
         if total_area <= 0:
             return face_groups
 
+        # Allocate an exact sphere budget across faces using largest-remainder
+        # apportionment so low-density runs don't bias toward early face order.
+        face_count = len(faces_data)
+        base_targets: List[int] = [0] * face_count
+        remainders: List[Tuple[float, int]] = []
+
+        if num_spheres >= face_count and face_count > 0:
+            for idx in range(face_count):
+                base_targets[idx] = 1
+            extra_budget = num_spheres - face_count
+        else:
+            extra_budget = num_spheres
+
+        assigned_extra = 0
+        for idx, (_, _, area) in enumerate(faces_data):
+            raw_extra = extra_budget * (area / total_area)
+            extra_floor = int(raw_extra)
+            base_targets[idx] += extra_floor
+            remainders.append((raw_extra - extra_floor, idx))
+            assigned_extra += extra_floor
+
+        remaining_extra = extra_budget - assigned_extra
+        if remaining_extra > 0:
+            remainders.sort(key=lambda item: item[0], reverse=True)
+            for _, face_idx in remainders[:remaining_extra]:
+                base_targets[face_idx] += 1
+
         # Build classifier for inside/outside checks
         classifier = None
         if parent_solid is not None:
@@ -599,9 +1047,10 @@ class StencilStippleProcessor:
             except Exception:
                 pass
 
-        for face, _, area in faces_data:
-            # Allocate spheres proportionally to face area
-            face_spheres = max(1, int(num_spheres * (area / total_area)))
+        for face_idx, (face, _, _area) in enumerate(faces_data):
+            face_spheres = base_targets[face_idx]
+            if face_spheres <= 0:
+                continue
             face_positions: List[Tuple[gp_Pnt, float, gp_Vec]] = []
 
             try:
@@ -643,9 +1092,9 @@ class StencilStippleProcessor:
                     cumulative += t_area
                     cum_areas.append(cumulative)
 
-                # Determine inward normal direction for this face ONCE
-                # using the centroid of a representative triangle
-                inward_sign = -1.0  # default
+                # Determine a fallback outward normal sign for this face.
+                # A per-point sign is still resolved below for robustness.
+                outward_sign_face = 1.0  # +normal means outward
                 if classifier is not None:
                     rep = triangles[len(triangles) // 2]
                     rp1, rp2, rp3, _ = rep
@@ -674,9 +1123,9 @@ class StencilStippleProcessor:
                         neg_inside = classifier.State() == TopAbs_IN
 
                         if pos_inside and not neg_inside:
-                            inward_sign = 1.0
+                            outward_sign_face = -1.0
                         elif neg_inside and not pos_inside:
-                            inward_sign = -1.0
+                            outward_sign_face = 1.0
 
                 for _ in range(face_spheres):
                     # Pick a random triangle weighted by area
@@ -740,43 +1189,60 @@ class StencilStippleProcessor:
                     if offset < 0:
                         offset = 0
 
+                    # Resolve outward direction per-point to avoid relying on
+                    # a single face-level normal orientation on complex faces.
+                    outward_sign = outward_sign_face
+                    if classifier is not None:
+                        probe_dist = max(radius * 0.6, 0.35)
+                        probe_pos = gp_Pnt(
+                            pnt.X() + normal.X() * probe_dist,
+                            pnt.Y() + normal.Y() * probe_dist,
+                            pnt.Z() + normal.Z() * probe_dist,
+                        )
+                        probe_neg = gp_Pnt(
+                            pnt.X() - normal.X() * probe_dist,
+                            pnt.Y() - normal.Y() * probe_dist,
+                            pnt.Z() - normal.Z() * probe_dist,
+                        )
+                        classifier.Perform(probe_pos, 1e-4)
+                        pos_inside = classifier.State() == TopAbs_IN
+                        classifier.Perform(probe_neg, 1e-4)
+                        neg_inside = classifier.State() == TopAbs_IN
+
+                        if pos_inside and not neg_inside:
+                            outward_sign = -1.0
+                        elif neg_inside and not pos_inside:
+                            outward_sign = 1.0
+
                     center = gp_Pnt(
-                        pnt.X() - inward_sign * normal.X() * offset,
-                        pnt.Y() - inward_sign * normal.Y() * offset,
-                        pnt.Z() - inward_sign * normal.Z() * offset,
+                        pnt.X() + normal.X() * offset * outward_sign,
+                        pnt.Y() + normal.Y() * offset * outward_sign,
+                        pnt.Z() + normal.Z() * offset * outward_sign,
                     )
 
-                    # Ensure the center lands outside the solid.
-                    # Track if we had to flip the direction
-                    center_was_flipped = False
+                    # Ensure center is outside current solid; if not, try flipped.
                     if classifier is not None:
                         classifier.Perform(center, 1e-4)
                         if classifier.State() == TopAbs_IN:
-                            # Flip the offset direction
-                            center = gp_Pnt(
-                                pnt.X() + inward_sign * normal.X() * offset,
-                                pnt.Y() + inward_sign * normal.Y() * offset,
-                                pnt.Z() + inward_sign * normal.Z() * offset,
+                            center_alt = gp_Pnt(
+                                pnt.X() - normal.X() * offset * outward_sign,
+                                pnt.Y() - normal.Y() * offset * outward_sign,
+                                pnt.Z() - normal.Z() * offset * outward_sign,
                             )
-                            center_was_flipped = True
-                            classifier.Perform(center, 1e-4)
+                            classifier.Perform(center_alt, 1e-4)
                             if classifier.State() == TopAbs_IN:
                                 continue
+                            center = center_alt
+                            outward_sign *= -1.0
 
-                    # Calculate outward direction, accounting for flip
-                    if center_was_flipped:
-                        outward_dir = gp_Vec(normal.X(), normal.Y(), normal.Z())
-                        outward_dir.Multiply(inward_sign)
-                    else:
-                        outward_dir = gp_Vec(normal.X(), normal.Y(), normal.Z())
-                        outward_dir.Multiply(-inward_sign)
+                    outward_dir = gp_Vec(normal.X(), normal.Y(), normal.Z())
+                    outward_dir.Multiply(outward_sign)
                     
                     face_positions.append((center, radius, outward_dir))
                     total_placed += 1
 
                     if total_placed >= num_spheres:
-                        face_groups.append(face_positions)
-                        return face_groups
+                        break
 
             except Exception:
                 continue

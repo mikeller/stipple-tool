@@ -31,6 +31,73 @@ class MeshStippleEngine:
         self.coverage_factor = max(0.1, coverage_factor)
         self.max_total_points = max(100, min(20000, int(max_total_points)))
 
+    def _postprocess_printable_mesh(
+        self,
+        mesh: trimesh.Trimesh,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> trimesh.Trimesh:
+        """Best-effort cleanup for printable output quality."""
+        try:
+            import trimesh.repair as repair
+
+            if status_callback:
+                status_callback("Repairing mesh for printable output...")
+
+            try:
+                mesh.remove_infinite_values()
+            except Exception:
+                pass
+
+            try:
+                mesh.remove_unreferenced_vertices()
+            except Exception:
+                pass
+
+            try:
+                mesh.remove_duplicate_faces()
+            except Exception:
+                pass
+
+            try:
+                mesh.remove_degenerate_faces()
+            except Exception:
+                pass
+
+            try:
+                repair.fix_winding(mesh)
+            except Exception:
+                pass
+
+            try:
+                repair.fix_normals(mesh, multibody=True)
+            except Exception:
+                pass
+
+            if not mesh.is_watertight:
+                try:
+                    repair.fill_holes(mesh)
+                except Exception:
+                    pass
+
+            try:
+                mesh.process(validate=True)
+            except Exception:
+                pass
+
+            if status_callback:
+                status_callback(
+                    "Mesh status: "
+                    f"watertight={mesh.is_watertight}, "
+                    f"winding_consistent={mesh.is_winding_consistent}, "
+                    f"euler={mesh.euler_number}"
+                )
+
+            return mesh
+        except Exception as e:
+            if status_callback:
+                status_callback(f"Mesh repair warning: {e}")
+            return mesh
+
     def apply_stippling_to_mesh(
         self,
         mesh: trimesh.Trimesh,
@@ -74,8 +141,7 @@ class MeshStippleEngine:
             status_callback(f"Sampling {count} stipple points on mesh...")
 
         submesh = mesh_out.submesh([face_indices], append=True, repair=False)
-        points, face_index = trimesh.sample.sample_surface(submesh, count)
-        face_normals = submesh.face_normals[face_index]
+        points, _face_index = trimesh.sample.sample_surface(submesh, count)
 
         target_vertex_indices = np.unique(faces[face_indices].reshape(-1))
         target_positions = vertices[target_vertex_indices]
@@ -123,10 +189,13 @@ class MeshStippleEngine:
 
         vertices = vertices - (vertex_normals * displacement[:, None])
         mesh_out.vertices = vertices
-        mesh_out.rezero()
-        mesh_out.remove_degenerate_faces()
-        mesh_out.remove_duplicate_faces()
-        mesh_out.remove_unreferenced_vertices()
+
+        try:
+            mesh_out.rezero()
+        except Exception:
+            pass
+
+        mesh_out = self._postprocess_printable_mesh(mesh_out, status_callback)
 
         if status_callback:
             status_callback("Mesh stippling complete")
