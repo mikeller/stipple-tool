@@ -7,6 +7,29 @@ from pathlib import Path
 from core.stencil_processor import StencilStippleProcessor
 
 
+def _run_manifold(args) -> int:
+    """Run STEP → mesh → manifold3d boolean difference pipeline."""
+    from core.manifold_stipple_processor import ManifoldStippleProcessor
+
+    processor = ManifoldStippleProcessor()
+    processor.random_seed = getattr(args, "mesh_seed", 42)
+    result = processor.process(
+        step_file=args.input,
+        output_path=args.output,
+        target_color=args.color,
+        sphere_radius=args.radius,
+        sphere_depth=args.depth,
+        spheres_per_mm2=args.spheres_per_mm2,
+        size_variation=not args.no_variation,
+        size_variation_mode=args.size_variation_mode,
+        size_variation_sigma=args.size_variation_sigma,
+        size_variation_min=args.size_variation_min,
+        size_variation_max=args.size_variation_max,
+        deflection=getattr(args, "mesh_deflection", 0.05),
+    )
+    return 0 if result else 1
+
+
 def _run_hybrid_stl(args) -> int:
     """Run STEP color-selection + mesh stippling + STL export pipeline."""
     from core.color_analyzer import ColorAnalyzer
@@ -188,9 +211,9 @@ def main():
     parser.add_argument("--export-stl", help="Also export to STL file (optional)")
     parser.add_argument(
         "--pipeline",
-        choices=["occ", "hybrid-stl"],
+        choices=["occ", "hybrid-stl", "manifold"],
         default="occ",
-        help="occ boolean-cuts pipeline, or hybrid STL-first mesh pipeline",
+        help="occ boolean-cuts, hybrid-stl mesh displacement, or manifold boolean-cuts via manifold3d",
     )
     parser.add_argument(
         "--log-file",
@@ -263,6 +286,8 @@ def main():
 
     if args.pipeline == "hybrid-stl":
         return _run_hybrid_stl(args)
+    if args.pipeline == "manifold":
+        return _run_manifold(args)
     return _run_occ_stencil(args)
 
 

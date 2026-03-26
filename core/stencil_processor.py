@@ -14,15 +14,18 @@ Fuzzy booleans (SetFuzzyValue) relax geometric tolerance so near-tangent
 intersections are resolved reliably.
 """
 
+import multiprocessing
+import os
 import random
+import tempfile
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Callable, Dict, List, Optional, Tuple
 
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
-from OCP.BRep import BRep_Tool
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+from OCP.BRep import BRep_Builder, BRep_Tool
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Cut
+from OCP.BRepTools import BRepTools
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeSphere
@@ -36,6 +39,47 @@ from OCP.gp import gp_Pnt, gp_Vec
 
 from core.color_analyzer import ColorAnalyzer
 from core.step_loader import STEPLoader
+
+
+def _subprocess_boolean_cut(shape_brep_path, compound_brep_path, result_brep_path, fuzzy_value):
+    """Perform a boolean cut in a child process.
+
+    Reads shape and compound from BREP files, runs BRepAlgoAPI_Cut,
+    and writes the result to a BREP file.  If anything fails the result
+    file is simply not created — the caller handles that.
+    """
+    try:
+        from OCP.BRepTools import BRepTools
+        from OCP.BRep import BRep_Builder
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.TopoDS import TopoDS_Shape
+
+        builder = BRep_Builder()
+
+        shape = TopoDS_Shape()
+        if not BRepTools.Read_s(shape, shape_brep_path, builder):
+            return
+
+        compound = TopoDS_Shape()
+        if not BRepTools.Read_s(compound, compound_brep_path, builder):
+            return
+
+        cut = BRepAlgoAPI_Cut()
+        args = TopTools_ListOfShape()
+        args.Append(shape)
+        cut.SetArguments(args)
+        tools = TopTools_ListOfShape()
+        tools.Append(compound)
+        cut.SetTools(tools)
+        cut.SetFuzzyValue(fuzzy_value)
+        cut.Build()
+
+        if cut.IsDone() and not cut.Shape().IsNull():
+            BRepTools.Write_s(cut.Shape(), result_brep_path)
+    except Exception as exc:
+        import sys
+        print(f"subprocess_boolean_cut error: {exc}", file=sys.stderr)
 
 
 class StencilStippleProcessor:
@@ -213,6 +257,62 @@ class StencilStippleProcessor:
         except Exception:
             return None
 
+    def _strip_non_solid_topology(
+        self,
+        shape: TopoDS_Shape,
+        expected_volume: float,
+        reference_point: Optional[gp_Pnt],
+    ) -> Optional[Tuple[TopoDS_Shape, float]]:
+        """Detect and strip non-solid topology (sheets/shells/faces) from a shape.
+
+        Boolean operations sometimes produce compound shapes containing both
+        solids and free shells/faces ("sheet" artifacts).  These sheets have
+        negligible volume and pass volume-based validation, but they corrupt
+        downstream geometry when carried through STEP round-trips.
+
+        Returns (cleaned_shape, cleaned_volume) or None if no solids remain.
+        """
+        try:
+            from OCP.TopAbs import TopAbs_COMPOUND
+
+            # If shape is already a solid, nothing to strip
+            if shape.ShapeType() == TopAbs_SOLID:
+                return shape, expected_volume
+
+            # If not a compound, check if it contains solids at all
+            if shape.ShapeType() != TopAbs_COMPOUND:
+                return shape, expected_volume
+
+            # It's a compound — check if all direct children are solids
+            from OCP.TopoDS import TopoDS_Iterator
+            all_solid = True
+            child_count = 0
+            it = TopoDS_Iterator(shape)
+            while it.More():
+                child = it.Value()
+                if child.ShapeType() != TopAbs_SOLID:
+                    all_solid = False
+                child_count += 1
+                it.Next()
+
+            if all_solid:
+                # No sheet artifacts — compound of solids only
+                return shape, expected_volume
+
+            # Non-solid children detected — rebuild from solids only
+            cleaned = self._extract_solids_only_shape(shape, reference_point)
+            if cleaned is None:
+                return None
+
+            vp = GProp_GProps()
+            BRepGProp.VolumeProperties_s(cleaned, vp)
+            cleaned_vol = abs(vp.Mass())
+
+            return cleaned, cleaned_vol
+        except Exception:
+            # If detection fails, return shape unchanged
+            return shape, expected_volume
+
     def _is_shape_valid(self, shape: TopoDS_Shape) -> bool:
         """Return True when OCC reports a topologically valid shape."""
         try:
@@ -251,6 +351,13 @@ class StencilStippleProcessor:
             timestamped = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
             if debug_log_path:
                 status_log_lines.append(timestamped)
+                # Also write immediately for real-time monitoring
+                try:
+                    with open(debug_log_path, "a", encoding="utf-8") as f:
+                        f.write(timestamped + "\n")
+                        f.flush()
+                except Exception:
+                    pass  # Ignore file write errors, will try again at end
             if status_callback:
                 status_callback(msg)
             else:
@@ -261,6 +368,13 @@ class StencilStippleProcessor:
                 cancel_callback()
 
         try:
+            # Clear log file at start if specified
+            if debug_log_path:
+                try:
+                    open(debug_log_path, "w", encoding="utf-8").close()
+                except Exception:
+                    pass
+
             emit_status("=== STENCIL STIPPLING ===")
 
             loader = STEPLoader()
@@ -399,6 +513,16 @@ class StencilStippleProcessor:
                 face_entries.sort(key=lambda item: len(item[2]), reverse=True)
 
             seed_count = max(0, int(seed_spheres_per_face))
+            # On high-face-count models, a full seed pass can consume thousands
+            # of cuts before any large-face remainder is attempted. That makes
+            # remainder batches much more likely to fail due to topology complexity
+            # and causes visible density starvation on primary faces.
+            if seed_count > 0 and len(face_entries) > 60:
+                emit_status(
+                    f"Seed pass disabled for large model ({len(face_entries)} faces) "
+                    f"to prioritize full processing of major faces"
+                )
+                seed_count = 0
             if seed_count > 0:
                 seeded_entries = []
                 remainder_entries = []
@@ -440,7 +564,18 @@ class StencilStippleProcessor:
                 i: target_faces_data[i] for i in range(len(target_faces_data))
             }
 
-            executor = ThreadPoolExecutor(max_workers=1)
+            # v17: Subprocess-based boolean cuts with hard-kill timeout.
+            # Each cut runs in a forked child process.  If it exceeds the
+            # timeout, proc.kill() delivers SIGKILL — truly terminating
+            # the underlying C++ OCC operation.  This prevents the
+            # abandoned-thread pile-up that caused v16 to hang.
+            _mp_ctx = multiprocessing.get_context("fork")
+            _cut_tmp_dir = tempfile.mkdtemp(prefix="stipple_cuts_")
+            _shape_brep_path = os.path.join(_cut_tmp_dir, "shape.brep")
+            _compound_brep_path = os.path.join(_cut_tmp_dir, "compound.brep")
+            _result_brep_path = os.path.join(_cut_tmp_dir, "result.brep")
+            _shape_brep_current_id = None  # id() of last-written shape
+
             interrupted = False
             timed_out = 0
 
@@ -463,30 +598,59 @@ class StencilStippleProcessor:
                 compound: TopoDS_Compound,
                 timeout_s: float,
             ) -> Optional[TopoDS_Shape]:
-                """Cut compound from shape with timeout.  Returns result or None."""
-                nonlocal executor
+                """Cut compound from shape in a subprocess with hard-kill timeout."""
+                nonlocal _shape_brep_current_id
                 try:
-                    cut = BRepAlgoAPI_Cut()
-                    a = TopTools_ListOfShape()
-                    a.Append(shape)
-                    cut.SetArguments(a)
-                    t = TopTools_ListOfShape()
-                    t.Append(compound)
-                    cut.SetTools(t)
-                    cut.SetFuzzyValue(0.01)
+                    # Remove stale result
+                    if os.path.exists(_result_brep_path):
+                        os.unlink(_result_brep_path)
 
-                    future = executor.submit(cut.Build)
-                    try:
-                        future.result(timeout=timeout_s)
-                    except FutureTimeout:
-                        executor.shutdown(wait=False)
-                        executor = ThreadPoolExecutor(max_workers=1)
+                    # Write shape BREP (cached — skip if unchanged)
+                    if id(shape) != _shape_brep_current_id:
+                        if not BRepTools.Write_s(shape, _shape_brep_path):
+                            emit_status("    BREP write failed for shape")
+                            return None
+                        _shape_brep_current_id = id(shape)
+
+                    # Write compound BREP (always new per batch)
+                    if not BRepTools.Write_s(compound, _compound_brep_path):
+                        emit_status("    BREP write failed for compound")
                         return None
 
-                    if cut.IsDone() and not cut.Shape().IsNull():
-                        return cut.Shape()
-                except Exception:
-                    pass
+                    # Run cut in a child process
+                    proc = _mp_ctx.Process(
+                        target=_subprocess_boolean_cut,
+                        args=(
+                            _shape_brep_path,
+                            _compound_brep_path,
+                            _result_brep_path,
+                            0.01,
+                        ),
+                    )
+                    proc.start()
+                    proc.join(timeout=timeout_s)
+
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=5)
+                        return None
+
+                    if proc.exitcode != 0:
+                        emit_status(
+                            f"    Subprocess exit code {proc.exitcode}"
+                        )
+                        return None
+
+                    # Read back result
+                    if os.path.exists(_result_brep_path):
+                        builder = BRep_Builder()
+                        result = TopoDS_Shape()
+                        if BRepTools.Read_s(
+                            result, _result_brep_path, builder
+                        ):
+                            return result
+                except Exception as exc:
+                    emit_status(f"    Batch cut error: {exc}")
                 return None
 
             def _validate_batch_result(
@@ -517,19 +681,44 @@ class StencilStippleProcessor:
                 # material. A tiny negative value can be numerical noise.
                 if removed < -0.05:
                     return None, 0.0
-                # Guard against zero-intersection cuts that produce only a
-                # circular seam curve (circle-only artifact) without actually
-                # removing any cap material.
-                if removed < 0.001:
-                    return None, 0.0
-                # Sanity: removal should not vastly exceed the total sphere
-                # volume (with generous 3x headroom for partial overlaps and
-                # thin-wall merging).
-                total_sphere_vol = sum(
-                    (4.0 / 3.0) * 3.14159 * r ** 3
-                    for _, r, _ in batch_positions
+                # v19.1: Cap-volume-based thresholds with accurate
+                # effective depth per sphere.
+                # effective_depth = sphere_depth * (r / sphere_radius),
+                # clamped to sphere_depth * 1.5 and r (mirrors positioning).
+                expected_cap_vol = 0.0
+                for _, r, _ in batch_positions:
+                    eff_d = min(
+                        sphere_depth * r / max(sphere_radius, 1e-9),
+                        sphere_depth * 1.5,
+                        r,
+                    )
+                    expected_cap_vol += (
+                        3.14159 * eff_d ** 2 / 3.0 * (3.0 * r - eff_d)
+                    )
+                per_sphere_ratio = (
+                    (removed / expected_cap_vol) if expected_cap_vol > 0 else 0.0
                 )
-                if total_sphere_vol > 0 and removed > total_sphere_vol * 3.0:
+                # Minimum: reject if removal < 35% of expected cap volume.
+                # Catches circle-only artifacts (seam without visible depression).
+                if expected_cap_vol > 0 and removed < expected_cap_vol * 0.35:
+                    emit_status(
+                        f"    [validate] REJECT min: {len(batch_positions)} "
+                        f"spheres, removed {removed:.3f} mm³, "
+                        f"expected {expected_cap_vol:.3f} mm³, "
+                        f"ratio {per_sphere_ratio:.2f}×"
+                    )
+                    return None, 0.0
+                # Maximum: reject if removal > 5x expected cap volume.
+                # Catches donut/breakthrough artifacts (sphere punching through).
+                # Full breakthrough = ~7.7× cap volume; 5× stops donuts while
+                # allowing moderate overcutting from surface curvature.
+                if expected_cap_vol > 0 and removed > expected_cap_vol * 5.0:
+                    emit_status(
+                        f"    [validate] REJECT max: {len(batch_positions)} "
+                        f"spheres, removed {removed:.3f} mm³, "
+                        f"expected {expected_cap_vol:.3f} mm³, "
+                        f"ratio {per_sphere_ratio:.2f}×"
+                    )
                     return None, 0.0
 
                 # Handle split solids
@@ -545,13 +734,28 @@ class StencilStippleProcessor:
                         and total_vol > 0
                         and (largest_vol / total_vol) >= 0.90
                     ):
-                        return largest, largest_vol
+                        result = largest
+                        new_vol = largest_vol
+                    else:
+                        # Solid split without a dominant component — reject the
+                        # batch so it gets split or retried with fresh positions.
+                        return None, 0.0
 
-                    # Solid split without a dominant component — reject the
-                    # batch so it gets split or retried with fresh positions.
-                    # clip_to_boundary was removed here: the BRepAlgoAPI_Common
-                    # it used produced stray sheet geometry and impossible volume
-                    # anomalies (see v6/v7 run notes).
+                # v22: Strip non-solid topology (sheets/shells) that boolean
+                # operations sometimes produce.  These have near-zero volume
+                # and pass all volume-based checks, but corrupt downstream
+                # geometry when carried through STEP round-trips.
+                cleaned = self._strip_non_solid_topology(
+                    result, new_vol, reference_inside_point
+                )
+                if cleaned is not None:
+                    result, new_vol = cleaned
+                else:
+                    # Shape had no solids after stripping — reject
+                    emit_status(
+                        f"    [validate] REJECT: no solid topology "
+                        f"remains after sheet stripping"
+                    )
                     return None, 0.0
 
                 return result, new_vol
@@ -621,11 +825,48 @@ class StencilStippleProcessor:
             min_batch_size = 5
 
             # Per-face guardrails to prevent pathological runs from appearing hung.
-            max_face_runtime_seconds = 900.0
+            # v16: Generous floor so the first slow+failed batch (often 200-280s)
+            # doesn't exhaust the budget before splitting gets a chance.
+            base_face_runtime_seconds = 600.0
             max_face_consecutive_failures = 40
 
+            # v12: Maximum batch size to prevent OCC complexity explosion.
+            # Large batches (400+) can cause exponentially slow operations.
+            max_initial_batch_size = 100
+
+            # v12: Per-batch timing guard. If any batch takes longer than this,
+            # the shape is getting complex - skip remaining batches for this face.
+            slow_batch_skip_threshold_seconds = 30.0  # v13: increased, chunks are simpler
+
+            # ============================================================
+            # v20: Pure per-face processing with STEP round-trip after
+            # each face.  Instead of the mega-batch approach (which
+            # caused accumulated geometry corruption), each face's
+            # spheres are cut, validated, and then the shape is
+            # round-tripped through STEP to reset OCC internal topology.
+            #
+            # Key improvements over v19:
+            # 1. STEP round-trip after every face (not just chunks)
+            # 2. Per-face rollback on validation/round-trip failure
+            # 3. Full-face regeneration retry considering already-
+            #    applied stipples when a face's batches all fail
+            # ============================================================
+
+            # Track applied positions per face for regeneration-aware retries
+            applied_positions_per_face: Dict[int, List[Tuple[gp_Pnt, float, gp_Vec]]] = {}
+
+            # Checkpoint directory for intermediate saves
+            checkpoint_dir = tempfile.mkdtemp(prefix="stipple_checkpoints_")
+            emit_status(f"Checkpoint directory: {checkpoint_dir}")
+            last_valid_checkpoint = None
+
+            emit_status(
+                f"v20: Per-face processing with STEP round-trip — "
+                f"{len(face_entries)} face entries"
+            )
+
             try:
-                for group_index, face_id, group in face_entries:
+                for entry_idx, (group_index, face_id, group) in enumerate(face_entries):
                     check_cancel()
 
                     elapsed = time.time() - cut_start
@@ -643,32 +884,42 @@ class StencilStippleProcessor:
                     face_start = time.time()
 
                     emit_status(
-                        f"  Face {face_id}: cutting {face_count} spheres "
-                        f"as batch..."
+                        f"\n  Face {face_id} ({entry_idx + 1}/"
+                        f"{len(face_entries)}): cutting {face_count} "
+                        f"spheres..."
                     )
 
-                    # Queue-based adaptive splitting.
-                    # If this face had a successful batch size in the seed pass,
-                    # pre-chunk the remainder at that size to skip the expensive
-                    # halving cascade that would otherwise start at the full group.
+                    # Save pre-face state for rollback
+                    pre_face_shape = current_shape
+                    pre_face_volume = current_volume
+
+                    # Queue-based adaptive splitting (proven logic from v14+).
                     _hint = face_seed_max_success.get(group_index, len(group))
+                    _hint = min(_hint, max_initial_batch_size)
                     if 0 < _hint < len(group):
                         queue = [
                             group[i : i + _hint]
                             for i in range(0, len(group), _hint)
                         ]
-                        # Avoid tiny trailing chunks (e.g. 2-4) from pre-chunking,
-                        # which correlate with circle-only/degenerate local artifacts.
-                        # Merge remainder into previous chunk so downstream logic
-                        # only sees robust batch sizes or min-batch fresh retries.
                         if len(queue) > 1 and len(queue[-1]) < min_batch_size:
                             queue[-2].extend(queue[-1])
                             queue.pop()
                     else:
-                        queue = [group]
+                        if len(group) > max_initial_batch_size:
+                            queue = [
+                                group[i : i + max_initial_batch_size]
+                                for i in range(0, len(group), max_initial_batch_size)
+                            ]
+                        else:
+                            queue = [group]
+
                     face_applied = 0
                     face_timed_out = 0
                     face_consecutive_failures = 0
+                    face_applied_positions: List[Tuple[gp_Pnt, float, gp_Vec]] = []
+                    max_face_runtime_seconds = max(
+                        base_face_runtime_seconds, face_count * 15.0
+                    )
 
                     while queue:
                         check_cancel()
@@ -679,19 +930,26 @@ class StencilStippleProcessor:
 
                         face_elapsed = time.time() - face_start
                         if face_elapsed >= max_face_runtime_seconds:
-                            skip_reasons["face_runtime_guard"] += len(queue)
+                            skip_reasons["face_runtime_guard"] += sum(
+                                len(b) for b in queue
+                            )
                             emit_status(
                                 f"    Face {face_id}: runtime guard hit "
-                                f"({face_elapsed:.0f}s) - skipping remaining batches"
+                                f"({face_elapsed:.0f}s) - skipping remaining"
                             )
                             break
 
-                        if face_consecutive_failures >= max_face_consecutive_failures:
-                            skip_reasons["face_failure_guard"] += len(queue)
+                        if (
+                            face_consecutive_failures
+                            >= max_face_consecutive_failures
+                        ):
+                            skip_reasons["face_failure_guard"] += sum(
+                                len(b) for b in queue
+                            )
                             emit_status(
                                 f"    Face {face_id}: failure guard hit "
-                                f"({face_consecutive_failures} consecutive) - "
-                                f"skipping remaining batches"
+                                f"({face_consecutive_failures} consecutive)"
+                                f" - skipping remaining"
                             )
                             break
 
@@ -709,27 +967,57 @@ class StencilStippleProcessor:
                         dt = time.time() - t0
 
                         if result is None:
-                            # Timed out or failed
                             face_timed_out += len(batch)
                             face_consecutive_failures += 1
+
+                            if dt >= slow_batch_skip_threshold_seconds:
+                                if len(batch) >= 2 * min_batch_size:
+                                    mid = len(batch) // 2
+                                    queue = [
+                                        batch[:mid], batch[mid:]
+                                    ] + queue
+                                    emit_status(
+                                        f"    Batch of {len(batch)} "
+                                        f"slow+failed ({dt:.1f}s) "
+                                        f"— splitting to {mid}"
+                                    )
+                                    continue
+                                else:
+                                    skip_reasons["slow_batch_guard"] += (
+                                        sum(len(b) for b in queue)
+                                        + len(batch)
+                                    )
+                                    emit_status(
+                                        f"    Batch of {len(batch)} "
+                                        f"slow+failed ({dt:.1f}s, min) "
+                                        f"— skip remaining face {face_id}"
+                                    )
+                                    break
+
                             if len(batch) >= 2 * min_batch_size:
                                 mid = len(batch) // 2
-                                queue.append(batch[:mid])
-                                queue.append(batch[mid:])
+                                queue = [
+                                    batch[:mid], batch[mid:]
+                                ] + queue
                                 emit_status(
-                                    f"    Batch of {len(batch)} failed/timed-out "
-                                    f"({dt:.1f}s) — splitting"
+                                    f"    Batch of {len(batch)} "
+                                    f"failed/timed-out ({dt:.1f}s) "
+                                    f"— splitting"
                                 )
                             else:
                                 placed = _try_fresh_cut(
-                                    group_index, len(batch), batch_timeout,
+                                    group_index,
+                                    len(batch),
+                                    batch_timeout,
                                     "timed-out",
                                 )
                                 if placed > 0:
                                     face_applied += placed
                                     face_consecutive_failures = 0
                                 else:
-                                    skip_reasons["batch_failed"] += len(batch)
+                                    skip_reasons["batch_failed"] += len(
+                                        batch
+                                    )
                             continue
 
                         valid_shape, new_vol = _validate_batch_result(
@@ -737,26 +1025,31 @@ class StencilStippleProcessor:
                         )
 
                         if valid_shape is None:
-                            # Validation failed — split and retry
                             face_consecutive_failures += 1
                             if len(batch) >= 2 * min_batch_size:
                                 mid = len(batch) // 2
-                                queue.append(batch[:mid])
-                                queue.append(batch[mid:])
+                                queue = [
+                                    batch[:mid], batch[mid:]
+                                ] + queue
                                 emit_status(
-                                    f"    Batch of {len(batch)} failed validation "
-                                    f"({dt:.1f}s) — splitting"
+                                    f"    Batch of {len(batch)} "
+                                    f"failed validation ({dt:.1f}s) "
+                                    f"— splitting"
                                 )
                             else:
                                 placed = _try_fresh_cut(
-                                    group_index, len(batch), batch_timeout,
+                                    group_index,
+                                    len(batch),
+                                    batch_timeout,
                                     "validation",
                                 )
                                 if placed > 0:
                                     face_applied += placed
                                     face_consecutive_failures = 0
                                 else:
-                                    skip_reasons["batch_validation"] += len(batch)
+                                    skip_reasons[
+                                        "batch_validation"
+                                    ] += len(batch)
                             continue
 
                         # Batch accepted
@@ -764,15 +1057,165 @@ class StencilStippleProcessor:
                         current_shape = valid_shape
                         current_volume = new_vol
                         face_applied += len(batch)
+                        face_applied_positions.extend(batch)
                         face_consecutive_failures = 0
-                        # Record largest success for this face (used as pre-chunk hint).
-                        if len(batch) > face_seed_max_success.get(group_index, 0):
+                        if len(batch) > face_seed_max_success.get(
+                            group_index, 0
+                        ):
                             face_seed_max_success[group_index] = len(batch)
                         emit_status(
                             f"    Batch of {len(batch)} ok ({dt:.1f}s, "
                             f"removed {removed:.2f} mm³)"
                         )
 
+                    # -------------------------------------------------
+                    # v20: If face got zero coverage, regenerate all
+                    # positions for this face — filtering out zones near
+                    # already-applied stipples — and retry once.
+                    # -------------------------------------------------
+                    if face_applied == 0 and face_count > 0:
+                        existing = applied_positions_per_face.get(
+                            group_index, []
+                        )
+                        emit_status(
+                            f"    Face {face_id}: 0/{face_count} — "
+                            f"regenerating ({len(existing)} exclusions)..."
+                        )
+                        face_data = origin_face_data_map.get(group_index)
+                        if face_data is not None:
+                            min_sep_sq = (sphere_radius * 1.5) ** 2
+                            for regen_attempt in range(3):
+                                try:
+                                    gen_n = int(face_count * 1.5)
+                                    fresh_groups = (
+                                        self._generate_sphere_positions_on_faces(
+                                            [face_data],
+                                            gen_n,
+                                            sphere_radius,
+                                            sphere_depth,
+                                            size_variation,
+                                            size_variation_mode,
+                                            size_variation_sigma,
+                                            size_variation_min,
+                                            size_variation_max,
+                                            parent_solid,
+                                        )
+                                    )
+                                except Exception:
+                                    continue
+                                if not fresh_groups or not fresh_groups[0]:
+                                    continue
+                                candidates = fresh_groups[0]
+                                if existing:
+                                    filtered = []
+                                    for pos in candidates:
+                                        c = pos[0]
+                                        ok = True
+                                        for ex in existing:
+                                            dx = c.X() - ex[0].X()
+                                            dy = c.Y() - ex[0].Y()
+                                            dz = c.Z() - ex[0].Z()
+                                            if (
+                                                dx * dx + dy * dy + dz * dz
+                                                < min_sep_sq
+                                            ):
+                                                ok = False
+                                                break
+                                        if ok:
+                                            filtered.append(pos)
+                                    candidates = filtered
+                                regen_positions = candidates[:face_count]
+                                if not regen_positions:
+                                    continue
+                                # v21: Process regen in chunks (same as
+                                # normal batch loop) instead of all-at-once.
+                                # This allows partial success on large faces.
+                                pre_regen_vol = current_volume
+                                regen_applied_local = 0
+                                regen_pos_local = []
+                                regen_chunk_sz = max_initial_batch_size
+                                for rch_start in range(
+                                    0, len(regen_positions), regen_chunk_sz
+                                ):
+                                    rch = regen_positions[
+                                        rch_start : rch_start + regen_chunk_sz
+                                    ]
+                                    rch_compound = _make_compound(rch)
+                                    rch_timeout = max(
+                                        60.0, len(rch) * 2.0
+                                    )
+                                    rch_result = _try_batch_cut(
+                                        current_shape,
+                                        rch_compound,
+                                        rch_timeout,
+                                    )
+                                    if rch_result is None:
+                                        continue
+                                    rv_shape, rv_vol = (
+                                        _validate_batch_result(
+                                            rch_result,
+                                            current_volume,
+                                            rch,
+                                        )
+                                    )
+                                    if rv_shape is not None:
+                                        current_shape = rv_shape
+                                        current_volume = rv_vol
+                                        regen_applied_local += len(rch)
+                                        regen_pos_local.extend(rch)
+                                    elif len(rch) > min_batch_size:
+                                        # Split once on failure
+                                        mid = len(rch) // 2
+                                        for sub in [
+                                            rch[:mid], rch[mid:]
+                                        ]:
+                                            sc = _make_compound(sub)
+                                            sr = _try_batch_cut(
+                                                current_shape,
+                                                sc,
+                                                max(
+                                                    30.0,
+                                                    len(sub) * 2.0,
+                                                ),
+                                            )
+                                            if sr is None:
+                                                continue
+                                            sv_s, sv_v = (
+                                                _validate_batch_result(
+                                                    sr,
+                                                    current_volume,
+                                                    sub,
+                                                )
+                                            )
+                                            if sv_s is not None:
+                                                current_shape = sv_s
+                                                current_volume = sv_v
+                                                regen_applied_local += (
+                                                    len(sub)
+                                                )
+                                                regen_pos_local.extend(
+                                                    sub
+                                                )
+                                if regen_applied_local > 0:
+                                    face_applied += regen_applied_local
+                                    face_applied_positions.extend(
+                                        regen_pos_local
+                                    )
+                                    if self._count_solid_components(
+                                        current_shape
+                                    ) >= 1:
+                                        last_valid_shape = current_shape
+                                    regen_removed = (
+                                        pre_regen_vol - current_volume
+                                    )
+                                    emit_status(
+                                        f"    Regen {regen_attempt + 1}/3: "
+                                        f"{regen_applied_local} spheres ok "
+                                        f"(removed {regen_removed:.2f} mm³)"
+                                    )
+                                    break
+
+                    # Update stats
                     applied += face_applied
                     face_skipped = face_count - face_applied
                     skipped += face_skipped
@@ -781,15 +1224,152 @@ class StencilStippleProcessor:
                     face_stats[group_index]["timeouts"] += face_timed_out
                     timed_out += face_timed_out
 
+                    # Track applied positions for this face
+                    if face_applied_positions:
+                        if group_index not in applied_positions_per_face:
+                            applied_positions_per_face[group_index] = []
+                        applied_positions_per_face[group_index].extend(
+                            face_applied_positions
+                        )
+
                     elapsed = time.time() - cut_start
                     emit_status(
-                        f"  Face {face_id}: {face_applied}/{face_count} applied "
-                        f"[{elapsed:.0f}s elapsed, {applied} total]"
+                        f"  Face {face_id}: {face_applied}/{face_count} "
+                        f"applied [{elapsed:.0f}s elapsed, {applied} total]"
                     )
 
-                    # Persist a known-good checkpoint for final export fallback.
-                    if face_applied > 0 and self._count_solid_components(current_shape) >= 1:
+                    # Persist known-good state
+                    if (
+                        face_applied > 0
+                        and self._count_solid_components(current_shape) >= 1
+                    ):
                         last_valid_shape = current_shape
+
+                    # -------------------------------------------------
+                    # v20/v23: Round-trip after EVERY face with applied
+                    # spheres.  This resets OCC internal topology and
+                    # prevents accumulated corruption.
+                    # v23: Use BREP round-trip for in-memory state
+                    # (preserves native OCC parametrisation), and save
+                    # STEP only as a checkpoint for final fallback.
+                    # STEP round-trip was poisoning subsequent booleans
+                    # by re-parameterising surfaces during translation.
+                    # On failure, roll back to pre-face state.
+                    # -------------------------------------------------
+                    if face_applied > 0:
+                        rt_success = False
+                        try:
+                            # Save STEP checkpoint for fallback
+                            step_path = os.path.join(
+                                checkpoint_dir,
+                                f"face_{entry_idx:04d}_{face_id}.step",
+                            )
+                            step_saved = loader.save_step(
+                                step_path, current_shape
+                            )
+                            if step_saved:
+                                last_valid_checkpoint = step_path
+
+                            # BREP round-trip for in-memory state
+                            brep_path = os.path.join(
+                                checkpoint_dir,
+                                f"face_{entry_idx:04d}_{face_id}.brep",
+                            )
+                            if BRepTools.Write_s(
+                                current_shape, brep_path
+                            ):
+                                rt_builder = BRep_Builder()
+                                rt_shape = TopoDS_Shape()
+                                if BRepTools.Read_s(
+                                    rt_shape, brep_path, rt_builder
+                                ):
+                                    rt_props = GProp_GProps()
+                                    BRepGProp.VolumeProperties_s(
+                                        rt_shape, rt_props
+                                    )
+                                    rt_vol = abs(rt_props.Mass())
+                                    vol_drift = abs(
+                                        rt_vol - current_volume
+                                    ) / max(current_volume, 1e-6)
+                                    if vol_drift < 0.05:
+                                        current_shape = rt_shape
+                                        current_volume = rt_vol
+                                        _shape_brep_current_id = None
+                                        rt_success = True
+                                        emit_status(
+                                            f"    BREP round-trip OK "
+                                            f"(drift "
+                                            f"{vol_drift * 100:.3f}%)"
+                                        )
+                                        # v22: Strip sheet artifacts
+                                        rt_cleaned = (
+                                            self._strip_non_solid_topology(
+                                                current_shape,
+                                                current_volume,
+                                                reference_inside_point,
+                                            )
+                                        )
+                                        if rt_cleaned is not None:
+                                            cs, cv = rt_cleaned
+                                            if cs is not current_shape:
+                                                emit_status(
+                                                    "    Stripped sheet "
+                                                    "artifacts from "
+                                                    "round-tripped shape"
+                                                )
+                                            current_shape = cs
+                                            current_volume = cv
+                                            _shape_brep_current_id = None
+                                    else:
+                                        emit_status(
+                                            f"    BREP round-trip drift "
+                                            f"{vol_drift * 100:.2f}% "
+                                            f"— will roll back"
+                                        )
+                                else:
+                                    emit_status(
+                                        "    BREP round-trip read "
+                                        "failed"
+                                    )
+                            else:
+                                emit_status(
+                                    "    BREP round-trip write failed"
+                                )
+                        except Exception as e:
+                            emit_status(
+                                f"    Round-trip error: {e}"
+                            )
+
+                        # Roll back if round-trip failed — the face's
+                        # cuts may have corrupted OCC internal state.
+                        if not rt_success:
+                            emit_status(
+                                f"    Rolling back face {face_id} "
+                                f"({face_applied} spheres)"
+                            )
+                            current_shape = pre_face_shape
+                            current_volume = pre_face_volume
+                            _shape_brep_current_id = None
+                            applied -= face_applied
+                            skipped += face_applied
+                            face_stats[group_index][
+                                "applied"
+                            ] -= face_applied
+                            face_stats[group_index][
+                                "skipped"
+                            ] += face_applied
+                            # Remove tracked positions on rollback
+                            if group_index in applied_positions_per_face:
+                                n_remove = len(face_applied_positions)
+                                applied_positions_per_face[
+                                    group_index
+                                ] = applied_positions_per_face[
+                                    group_index
+                                ][
+                                    :-n_remove
+                                ] if n_remove else applied_positions_per_face[
+                                    group_index
+                                ]
 
             except KeyboardInterrupt:
                 interrupted = True
@@ -797,7 +1377,12 @@ class StencilStippleProcessor:
                     "  Interrupted by user — finalizing partial result"
                 )
             finally:
-                executor.shutdown(wait=False)
+                # Clean up subprocess temp files
+                import shutil as _shutil
+                try:
+                    _shutil.rmtree(_cut_tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
             skipped = total - applied
 
@@ -910,8 +1495,37 @@ class StencilStippleProcessor:
             # Save final shape
             emit_status(f"Saving result: {output_path}")
             if not loader.save_step(output_path, current_shape):
-                emit_status("Failed to write final STEP")
-                return None
+                emit_status("Failed to write final STEP from current shape")
+                # v16: Fall back to last valid checkpoint, strip sheets & heal
+                if last_valid_checkpoint and os.path.exists(last_valid_checkpoint):
+                    emit_status(f"Falling back to last checkpoint: {last_valid_checkpoint}")
+                    try:
+                        cp_loader = STEPLoader()
+                        cp_shape = cp_loader.load_step(last_valid_checkpoint)
+                        if cp_shape is not None:
+                            stripped = self._extract_solids_only_shape(
+                                cp_shape, reference_inside_point
+                            )
+                            if stripped is not None:
+                                cp_shape = stripped
+                            cp_shape = self._heal_shape_for_export(cp_shape, emit_status)
+                            if cp_loader.save_step(output_path, cp_shape):
+                                emit_status(f"Saved healed checkpoint to {output_path}")
+                            else:
+                                import shutil
+                                shutil.copy2(last_valid_checkpoint, output_path)
+                                emit_status(f"Heal+save failed; raw checkpoint copied to {output_path}")
+                        else:
+                            import shutil
+                            shutil.copy2(last_valid_checkpoint, output_path)
+                            emit_status(f"Could not reload checkpoint; copied raw to {output_path}")
+                    except Exception as cp_err:
+                        import shutil
+                        shutil.copy2(last_valid_checkpoint, output_path)
+                        emit_status(f"Checkpoint post-process error ({cp_err}); copied raw to {output_path}")
+                else:
+                    emit_status("No valid checkpoint available")
+                    return None
 
             emit_status("✓ Stencil stippling complete")
             return output_path
@@ -1237,7 +1851,32 @@ class StencilStippleProcessor:
 
                     outward_dir = gp_Vec(normal.X(), normal.Y(), normal.Z())
                     outward_dir.Multiply(outward_sign)
-                    
+
+                    # v20: Wall thickness pre-check — probe along the
+                    # inward normal at increasing depths.  If the probe
+                    # exits the solid within 2× effective_depth the wall
+                    # is too thin and the sphere would punch through.
+                    if classifier is not None:
+                        inward_x = -outward_dir.X()
+                        inward_y = -outward_dir.Y()
+                        inward_z = -outward_dir.Z()
+                        min_wall = effective_depth * 2.0
+                        wall_ok = True
+                        # Sample 3 depths: 1×, 1.5×, 2× effective_depth
+                        for probe_mult in (1.0, 1.5, 2.0):
+                            d = effective_depth * probe_mult
+                            probe = gp_Pnt(
+                                pnt.X() + inward_x * d,
+                                pnt.Y() + inward_y * d,
+                                pnt.Z() + inward_z * d,
+                            )
+                            classifier.Perform(probe, 1e-4)
+                            if classifier.State() != TopAbs_IN:
+                                wall_ok = False
+                                break
+                        if not wall_ok:
+                            continue
+
                     face_positions.append((center, radius, outward_dir))
                     total_placed += 1
 
@@ -1247,7 +1886,6 @@ class StencilStippleProcessor:
             except Exception:
                 continue
 
-            if face_positions:
-                face_groups.append(face_positions)
+            face_groups.append(face_positions)
 
         return face_groups
