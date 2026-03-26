@@ -131,11 +131,17 @@ class ManifoldStippleProcessor:
             emit("✗ No mesh triangles map to target STEP faces")
             return None
 
-        # Record target vertex POSITIONS (not indices) — positions survive
-        # vertex merging while indices do not.
+        # Record target triangle CENTROIDS (not vertex indices) for robust
+        # re-identification after mesh repair. Centroids are unique per-face
+        # and avoid the boundary-sharing problem of vertex-based matching.
         target_tri_indices_pre = np.where(target_tri_mask)[0]
-        target_vert_indices_pre = np.unique(part_mesh.faces[target_tri_indices_pre].ravel())
-        target_positions = part_mesh.vertices[target_vert_indices_pre]
+        orig_verts = np.asarray(part_mesh.vertices)
+        orig_faces = np.asarray(part_mesh.faces)
+
+        # Compute centroids for ALL original triangles, plus a label
+        # array marking which are target vs non-target.
+        all_orig_centroids = orig_verts[orig_faces].mean(axis=1)
+        orig_is_target = target_tri_mask.copy()  # bool array, length = num original tris
 
         # Merge coincident vertices & repair to make manifold
         emit("  Merging vertices and repairing mesh...")
@@ -177,45 +183,25 @@ class ManifoldStippleProcessor:
 
         emit(f"  euler={part_mesh.euler_number}, volume={abs(part_mesh.volume):.1f}")
 
-        # Re-identify target vertices by position lookup (KDTree).
-        # pymeshfix may slightly shift vertices, so use a reasonable tolerance.
+        # Re-identify target triangles by nearest-centroid classification.
+        # For each repaired triangle, find the closest original centroid
+        # (target or non-target). If it belonged to a target triangle, the
+        # repaired triangle is classified as target.
         from scipy.spatial import cKDTree
-        tree = cKDTree(part_mesh.vertices)
-        tol = 0.01  # 0.01mm tolerance for vertex matching
-        dists, indices = tree.query(target_positions, distance_upper_bound=tol)
-        matched = indices[dists < tol]
-        target_vertex_set = set(matched)
-        emit(f"  Matched {len(target_vertex_set)} target vertices "
-             f"(from {len(target_positions)} original, tol={tol}mm)")
-
-        # Target triangles: all 3 vertices are in the target set
-        target_tri_indices = np.array([
-            i for i in range(len(part_mesh.faces))
-            if all(v in target_vertex_set for v in part_mesh.faces[i])
-        ])
-
-        # If too few triangles found, also match by face centroid proximity
-        # to the original target surface
-        if len(target_tri_indices) < len(target_tri_indices_pre) * 0.5:
-            emit(f"  Vertex match got only {len(target_tri_indices)} tris "
-                 f"(expected ~{len(target_tri_indices_pre)}), "
-                 f"falling back to centroid proximity...")
-            # Build a reference submesh from original target triangles
-            orig_verts = np.asarray(converted[0].vertices)
-            orig_faces = np.asarray(converted[0].faces)
-            orig_target_faces = orig_faces[target_tri_indices_pre]
-            # Get centroids of original target triangles
-            orig_centroids = orig_verts[orig_target_faces].mean(axis=1)
-            ref_tree = cKDTree(orig_centroids)
-
-            # For each repaired mesh face, check if its centroid is close
-            # to any original target centroid
-            repaired_centroids = part_mesh.vertices[part_mesh.faces].mean(axis=1)
-            dists2, _ = ref_tree.query(repaired_centroids)
-            # A face is "target" if its centroid is within 0.5mm of an
-            # original target centroid (generous for mesh restructuring)
-            target_tri_indices = np.where(dists2 < 0.5)[0]
-            emit(f"  Centroid proximity matched {len(target_tri_indices)} tris")
+        ref_tree = cKDTree(all_orig_centroids)
+        repaired_centroids = part_mesh.vertices[part_mesh.faces].mean(axis=1)
+        dists, nearest_idx = ref_tree.query(repaired_centroids)
+        # A repaired triangle is "target" if its nearest original centroid
+        # was a target triangle AND the distance is reasonable.
+        orig_edge_len = np.sqrt(part_mesh.area_faces.mean()) * 1.0
+        centroid_tol = max(0.1, min(orig_edge_len, 0.5))
+        is_matched = (dists < centroid_tol) & orig_is_target[nearest_idx]
+        target_tri_indices = np.where(is_matched)[0]
+        matched_area = part_mesh.area_faces[target_tri_indices].sum() if len(target_tri_indices) > 0 else 0
+        emit(f"  Matched {len(target_tri_indices)} target triangles "
+             f"(centroid tol={centroid_tol:.3f}mm, "
+             f"orig {len(target_tri_indices_pre)} tris, "
+             f"matched area={matched_area:.0f}mm²)")
 
         if len(target_tri_indices) == 0:
             emit("✗ No mesh triangles survive repair for target faces")
@@ -292,20 +278,43 @@ class ManifoldStippleProcessor:
         points, face_ids = trimesh.sample.sample_surface(submesh, num_spheres)
 
         # Get normals at sampled points (from the triangle they fell on)
-        normals = submesh.face_normals[face_ids]
+        # The repaired mesh has consistent outward-facing normals (positive
+        # volume was verified after repair/flip).  submesh preserves face
+        # winding from the parent mesh, so submesh.face_normals already
+        # point outward — no centroid-based heuristic needed.
+        outward_normals = submesh.face_normals[face_ids].copy()
 
-        # Determine outward vs inward direction by checking if the normal
-        # points away from the mesh interior. We use the mesh centroid as
-        # a rough "inside" reference.
-        centroid = mesh.centroid
-        to_centroid = centroid - points
-        # If normal · (centroid - point) > 0, normal points inward → flip
-        dots = np.einsum("ij,ij->i", normals, to_centroid)
-        outward_normals = normals.copy()
-        flip_mask = dots > 0
-        outward_normals[flip_mask] *= -1
+        # --- Compute boundary edges and edge margin ---
+        # Find the boundary of the target submesh: edges that appear in only
+        # one triangle. Sphere positions near this boundary will "run over"
+        # into non-target surfaces.
+        boundary_points = self._get_submesh_boundary_points(submesh)
+
+        # The lateral radius of the sphere cap on the surface:
+        # r_lateral = sqrt(2*R*d - d²) where R=radius, d=depth
+        base_lateral = np.sqrt(max(0, 2 * base_radius * sphere_depth - sphere_depth**2))
+
+        # Pre-build KDTree of boundary points for fast proximity queries
+        boundary_tree = cKDTree(boundary_points) if len(boundary_points) > 0 else None
+
+        # --- Curvature for depth compensation ---
+        # On concave surfaces a sphere cuts deeper than the nominal depth
+        # because the surface curves toward the sphere centre.  We measure
+        # curvature so we can *reduce* the depth on concave areas and
+        # *increase* it slightly on convex areas, keeping effective depth
+        # approximately constant.
+        point_curvatures = self._compute_point_curvatures(mesh, submesh, points, face_ids)
+        nz = point_curvatures[point_curvatures != 0]
+        if len(nz) > 0:
+            print(f"  Curvature stats: min={nz.min():.4f}, median={np.median(nz):.4f}, "
+                  f"max={nz.max():.4f}, nonzero={len(nz)}/{len(point_curvatures)}")
+
+        # --- Thin-wall check: use ray casting on the full mesh ---
+        ray_caster = mesh  # trimesh has built-in ray casting
 
         sphere_specs = []
+        edge_rejected = 0
+        thin_rejected = 0
         for i in range(len(points)):
             if size_variation:
                 if size_variation_mode == "gaussian":
@@ -317,9 +326,53 @@ class ManifoldStippleProcessor:
             else:
                 radius = base_radius
 
-            # Effective depth scales slightly with radius
-            scale_factor = 1.0 + 0.15 * ((radius / base_radius) - 1.0)
-            effective_depth = min(sphere_depth * scale_factor, sphere_depth * 1.5, radius)
+            # --- Curvature-compensated depth ---
+            # trimesh: κ > 0 = convex, κ < 0 = concave.
+            # On a concave surface (κ < 0) the sphere sinks deeper than
+            # nominal because the surface curves toward the sphere.
+            # The extra depth at the edge of the dimple ≈ r_lat² · |κ| / 2.
+            # We subtract this from the nominal depth to keep actual max
+            # depth approximately equal to sphere_depth on any curvature.
+            kappa = point_curvatures[i]
+            r_lat = np.sqrt(max(0, 2 * radius * sphere_depth - sphere_depth**2))
+            curvature_extra = r_lat * r_lat * abs(kappa) / 2.0
+            if kappa < 0:
+                # Concave: reduce depth to compensate for the extra cut
+                effective_depth = sphere_depth - curvature_extra
+            else:
+                # Convex: surface curves away, sphere cuts shallower than
+                # nominal — we can add a bit but cap it conservatively
+                effective_depth = sphere_depth + curvature_extra * 0.5
+
+            # Clamp depth to a safe range
+            effective_depth = max(sphere_depth * 0.3, min(sphere_depth, effective_depth))
+            effective_depth = min(effective_depth, radius)
+
+            # Edge margin check: reject if sphere cap would extend past
+            # the target region boundary
+            lateral_r = np.sqrt(max(0, 2 * radius * effective_depth - effective_depth**2))
+            if boundary_tree is not None:
+                dist_to_edge, _ = boundary_tree.query(points[i])
+                if dist_to_edge < lateral_r:
+                    edge_rejected += 1
+                    continue
+
+            # Thin-wall check: cast ray inward, reject if the wall is
+            # thinner than the sphere depth (would punch through)
+            inward = -outward_normals[i]
+            # Start ray slightly inside the surface to avoid self-intersection
+            ray_origin = points[i] + inward * 0.01
+            locations, _, _ = ray_caster.ray.intersects_location(
+                ray_origins=[ray_origin],
+                ray_directions=[inward],
+            )
+            if len(locations) > 0:
+                # Distance to first intersection = wall thickness
+                wall_dists = np.linalg.norm(locations - ray_origin, axis=1)
+                wall_thickness = wall_dists.min()
+                if wall_thickness < effective_depth * 3.0:
+                    thin_rejected += 1
+                    continue
 
             # Offset centre outward so only a cap of `effective_depth` intersects
             offset = radius - effective_depth
@@ -331,6 +384,7 @@ class ManifoldStippleProcessor:
 
         # Poisson-disk-like rejection: remove spheres whose centres are
         # too close together (< base_radius * 0.8)
+        pre_poisson = len(sphere_specs)
         if len(sphere_specs) > 1:
             centres = np.array([s[0] for s in sphere_specs])
             tree = cKDTree(centres)
@@ -345,7 +399,119 @@ class ManifoldStippleProcessor:
                         keep[n] = False
             sphere_specs = [s for s, k in zip(sphere_specs, keep) if k]
 
+        poisson_rejected = pre_poisson - len(sphere_specs)
+        print(f"  Sphere placement: {len(points)} sampled, "
+              f"{edge_rejected} edge-rejected, {thin_rejected} thin-wall-rejected, "
+              f"{poisson_rejected} Poisson-rejected → {len(sphere_specs)} kept")
+
         return sphere_specs
+
+    @staticmethod
+    def _get_submesh_boundary_points(submesh: trimesh.Trimesh, num_samples: int = 500) -> np.ndarray:
+        """Return points along the boundary edges of a submesh.
+
+        Boundary edges are edges that belong to only one triangle
+        (i.e. the open boundary of the submesh).  We sample points
+        along these edges so we can quickly measure distance from any
+        surface point to the nearest boundary.
+        """
+        # facets_unique_edges: for each face, its 3 edge indices
+        # edges_unique: the actual vertex-pair for each edge index
+        edges = submesh.edges_sorted
+        # Count how many faces reference each edge
+        edge_tuples = [tuple(e) for e in edges]
+        from collections import Counter
+        edge_counts = Counter(edge_tuples)
+        boundary_edges = np.array([list(e) for e, c in edge_counts.items() if c == 1])
+
+        if len(boundary_edges) == 0:
+            return np.zeros((0, 3))
+
+        # Sample points along boundary edges
+        v0 = submesh.vertices[boundary_edges[:, 0]]
+        v1 = submesh.vertices[boundary_edges[:, 1]]
+
+        # Distribute samples proportional to edge length
+        edge_lengths = np.linalg.norm(v1 - v0, axis=1)
+        total_length = edge_lengths.sum()
+        if total_length < 1e-12:
+            return np.zeros((0, 3))
+
+        all_pts = []
+        for i in range(len(boundary_edges)):
+            n_samples = max(1, int(num_samples * edge_lengths[i] / total_length))
+            for t in np.linspace(0, 1, n_samples, endpoint=False):
+                all_pts.append(v0[i] + t * (v1[i] - v0[i]))
+
+        return np.array(all_pts) if all_pts else np.zeros((0, 3))
+
+    @staticmethod
+    def _compute_point_curvatures(
+        full_mesh: trimesh.Trimesh,
+        submesh: trimesh.Trimesh,
+        points: np.ndarray,
+        face_ids: np.ndarray,
+    ) -> np.ndarray:
+        """Estimate mean curvature at each sampled surface point.
+
+        Returns an array of signed mean curvatures (per point), where
+        positive = concave (dimple appears bigger) and negative = convex.
+        The sign convention matches outward-normal: concave surfaces have
+        normals pointing away from the centre of curvature.
+
+        Uses the discrete mean curvature measure (angle-deficit method)
+        on the full mesh, then interpolates per-vertex values to each
+        sample point via barycentric weights on the submesh triangle.
+        """
+        n_pts = len(points)
+        curvatures = np.zeros(n_pts)
+
+        try:
+            # Discrete mean curvature per vertex (trimesh built-in)
+            # The radius parameter defines the integration ball size;
+            # use ~2× average edge length for a good local estimate.
+            avg_edge = np.mean(full_mesh.edges_unique_length)
+            curv_radius = avg_edge * 2.0
+            vertex_mc = trimesh.curvature.discrete_mean_curvature_measure(
+                full_mesh, full_mesh.vertices, radius=curv_radius
+            )
+            # Normalize: the measure is an integral over a ball of radius r,
+            # divide by π·r² to get curvature in 1/mm units.
+            ball_area = np.pi * curv_radius**2
+            vertex_mc = vertex_mc / ball_area
+
+            # Map full-mesh vertex curvatures to submesh vertices.
+            # submesh shares vertex positions but may have different indices.
+            from scipy.spatial import cKDTree
+            full_tree = cKDTree(full_mesh.vertices)
+            _, v_map = full_tree.query(submesh.vertices)
+            sub_vertex_mc = vertex_mc[v_map]
+
+            # Interpolate to each sample point using barycentric coords
+            # on the submesh triangle it was sampled from.
+            for i in range(n_pts):
+                fid = face_ids[i]
+                tri_verts = submesh.faces[fid]  # 3 vertex indices
+                v0, v1, v2 = submesh.vertices[tri_verts]
+                # Barycentric coordinates via area method
+                p = points[i]
+                area_full = np.linalg.norm(np.cross(v1 - v0, v2 - v0))
+                if area_full < 1e-15:
+                    curvatures[i] = 0.0
+                    continue
+                w0 = np.linalg.norm(np.cross(v1 - p, v2 - p)) / area_full
+                w1 = np.linalg.norm(np.cross(v2 - p, v0 - p)) / area_full
+                w2 = 1.0 - w0 - w1
+                curvatures[i] = (
+                    w0 * sub_vertex_mc[tri_verts[0]]
+                    + w1 * sub_vertex_mc[tri_verts[1]]
+                    + w2 * sub_vertex_mc[tri_verts[2]]
+                )
+        except Exception as e:
+            # If curvature computation fails, return zeros (no compensation)
+            print(f"  Warning: curvature computation failed ({e}), skipping compensation")
+
+        return curvatures
 
     def _manifold_boolean_cut(
         self,
