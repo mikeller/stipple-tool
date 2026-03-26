@@ -60,7 +60,7 @@ class STEPMeshConverter:
         try:
             from OCP.BRep import BRep_Tool
             from OCP.TopExp import TopExp_Explorer
-            from OCP.TopAbs import TopAbs_FACE
+            from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
             from OCP.TopLoc import TopLoc_Location
             from OCP.TopoDS import TopoDS
         except ImportError as e:
@@ -120,7 +120,8 @@ class STEPMeshConverter:
                         node_get = face_nodes.Value
                     else:
                         node_count = len(face_nodes)
-                        node_get = lambda idx: face_nodes[idx - 1]
+                        def node_get(idx, _nodes=face_nodes):
+                            return _nodes[idx - 1]
 
                     for i in range(1, node_count + 1):
                         node = node_get(i)
@@ -133,7 +134,8 @@ class STEPMeshConverter:
                         tri_get = face_triangles.Value
                     else:
                         tri_count = len(face_triangles)
-                        tri_get = lambda idx: face_triangles[idx - 1]
+                        def tri_get(idx, _tris=face_triangles):
+                            return _tris[idx - 1]
 
                     for i in range(1, tri_count + 1):
                         triangle = tri_get(i)
@@ -146,6 +148,10 @@ class STEPMeshConverter:
                             v1 = v1 - 1 + face_vertex_offset
                             v2 = v2 - 1 + face_vertex_offset
                             v3 = v3 - 1 + face_vertex_offset
+                        # Flip winding for reversed faces to preserve
+                        # outward-facing normals
+                        if face.Orientation() == TopAbs_REVERSED:
+                            v2, v3 = v3, v2
                         faces.append([v1, v2, v3])
                         face_map.append(face_count)
 

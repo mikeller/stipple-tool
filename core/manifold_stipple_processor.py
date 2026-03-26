@@ -9,6 +9,7 @@ OCC BRepAlgoAPI_Cut on complex parts with thousands of sequential cuts.
 """
 import time
 import random
+from collections import Counter
 from typing import List, Tuple, Optional, Callable, Dict
 from pathlib import Path
 
@@ -20,8 +21,8 @@ from scipy.spatial import cKDTree
 class ManifoldStippleProcessor:
     """Stipple processor using manifold3d boolean engine via trimesh."""
 
-    def __init__(self):
-        self.random_seed = 42
+    def __init__(self, random_seed: int = 42):
+        self.random_seed = random_seed
 
     def process(
         self,
@@ -62,7 +63,8 @@ class ManifoldStippleProcessor:
         def emit(msg: str):
             if status_callback:
                 status_callback(msg)
-            print(msg)
+            else:
+                print(msg)
 
         emit("=" * 60)
         emit("MANIFOLD BOOLEAN STIPPLING")
@@ -187,7 +189,6 @@ class ManifoldStippleProcessor:
         # For each repaired triangle, find the closest original centroid
         # (target or non-target). If it belonged to a target triangle, the
         # repaired triangle is classified as target.
-        from scipy.spatial import cKDTree
         ref_tree = cKDTree(all_orig_centroids)
         repaired_centroids = part_mesh.vertices[part_mesh.faces].mean(axis=1)
         dists, nearest_idx = ref_tree.query(repaired_centroids)
@@ -271,7 +272,7 @@ class ManifoldStippleProcessor:
         a shallow cap (depth) intersects the solid.
         """
         target_area = mesh.area_faces[target_tri_indices].sum()
-        num_spheres = max(3, int(target_area * spheres_per_mm2))
+        num_spheres = max(1, int(np.ceil(target_area * spheres_per_mm2)))
 
         # Build a submesh of target triangles for sampling
         submesh = mesh.submesh([target_tri_indices], append=True, repair=False)
@@ -289,10 +290,6 @@ class ManifoldStippleProcessor:
         # one triangle. Sphere positions near this boundary will "run over"
         # into non-target surfaces.
         boundary_points = self._get_submesh_boundary_points(submesh)
-
-        # The lateral radius of the sphere cap on the surface:
-        # r_lateral = sqrt(2*R*d - d²) where R=radius, d=depth
-        base_lateral = np.sqrt(max(0, 2 * base_radius * sphere_depth - sphere_depth**2))
 
         # Pre-build KDTree of boundary points for fast proximity queries
         boundary_tree = cKDTree(boundary_points) if len(boundary_points) > 0 else None
@@ -321,7 +318,7 @@ class ManifoldStippleProcessor:
                     scale = random.gauss(1.0, size_variation_sigma)
                     scale = max(size_variation_min, min(size_variation_max, scale))
                 else:
-                    scale = 0.6 + random.random() * 0.8
+                    scale = size_variation_min + random.random() * (size_variation_max - size_variation_min)
                 radius = base_radius * scale
             else:
                 radius = base_radius
@@ -345,8 +342,7 @@ class ManifoldStippleProcessor:
                 effective_depth = sphere_depth + curvature_extra * 0.5
 
             # Clamp depth to a safe range
-            effective_depth = max(sphere_depth * 0.3, min(sphere_depth, effective_depth))
-            effective_depth = min(effective_depth, radius)
+            effective_depth = max(sphere_depth * 0.3, min(radius, effective_depth))
 
             # Edge margin check: reject if sphere cap would extend past
             # the target region boundary
@@ -387,16 +383,19 @@ class ManifoldStippleProcessor:
         pre_poisson = len(sphere_specs)
         if len(sphere_specs) > 1:
             centres = np.array([s[0] for s in sphere_specs])
+            radii = np.array([s[1] for s in sphere_specs])
             tree = cKDTree(centres)
-            min_dist = base_radius * 0.8
+            max_search_radius = radii.max() * 0.8
             keep = np.ones(len(sphere_specs), dtype=bool)
             for idx in range(len(sphere_specs)):
                 if not keep[idx]:
                     continue
-                neighbors = tree.query_ball_point(centres[idx], min_dist)
+                neighbors = tree.query_ball_point(centres[idx], max_search_radius)
                 for n in neighbors:
                     if n != idx and keep[n]:
-                        keep[n] = False
+                        pair_min_dist = max(radii[idx], radii[n]) * 0.8
+                        if np.linalg.norm(centres[idx] - centres[n]) < pair_min_dist:
+                            keep[n] = False
             sphere_specs = [s for s, k in zip(sphere_specs, keep) if k]
 
         poisson_rejected = pre_poisson - len(sphere_specs)
@@ -420,7 +419,6 @@ class ManifoldStippleProcessor:
         edges = submesh.edges_sorted
         # Count how many faces reference each edge
         edge_tuples = [tuple(e) for e in edges]
-        from collections import Counter
         edge_counts = Counter(edge_tuples)
         boundary_edges = np.array([list(e) for e, c in edge_counts.items() if c == 1])
 
@@ -454,10 +452,10 @@ class ManifoldStippleProcessor:
     ) -> np.ndarray:
         """Estimate mean curvature at each sampled surface point.
 
-        Returns an array of signed mean curvatures (per point), where
-        positive = concave (dimple appears bigger) and negative = convex.
-        The sign convention matches outward-normal: concave surfaces have
-        normals pointing away from the centre of curvature.
+        Returns an array of signed mean curvatures (per point).
+        trimesh convention: positive = convex, negative = concave.
+        On concave surfaces (κ < 0) the sphere sinks deeper than
+        nominal; on convex surfaces (κ > 0) it cuts shallower.
 
         Uses the discrete mean curvature measure (angle-deficit method)
         on the full mesh, then interpolates per-vertex values to each
@@ -482,7 +480,6 @@ class ManifoldStippleProcessor:
 
             # Map full-mesh vertex curvatures to submesh vertices.
             # submesh shares vertex positions but may have different indices.
-            from scipy.spatial import cKDTree
             full_tree = cKDTree(full_mesh.vertices)
             _, v_map = full_tree.query(submesh.vertices)
             sub_vertex_mc = vertex_mc[v_map]
@@ -528,38 +525,9 @@ class ManifoldStippleProcessor:
 
         t0 = time.time()
 
-        # Build all sphere meshes and union them into one manifold
-        emit(f"  Building {len(sphere_specs)} sphere meshes...")
-        batch_size = 500
-        sphere_batches = []
+        emit(f"  Preparing {len(sphere_specs)} spheres for manifold boolean...")
 
-        for batch_start in range(0, len(sphere_specs), batch_size):
-            batch_end = min(batch_start + batch_size, len(sphere_specs))
-            batch_spheres = []
-            for centre, radius in sphere_specs[batch_start:batch_end]:
-                sphere = trimesh.creation.icosphere(subdivisions=2, radius=radius)
-                sphere.apply_translation(centre)
-                batch_spheres.append(sphere)
-
-            # Concatenate batch into one mesh, then use manifold union
-            batch_mesh = trimesh.util.concatenate(batch_spheres)
-            sphere_batches.append(batch_mesh)
-            if len(sphere_specs) > batch_size:
-                emit(f"  Built batch {batch_start//batch_size + 1}/"
-                     f"{(len(sphere_specs) + batch_size - 1)//batch_size} "
-                     f"({batch_end - batch_start} spheres)")
-
-        # Union all batches
-        if len(sphere_batches) == 1:
-            tool_mesh = sphere_batches[0]
-        else:
-            tool_mesh = trimesh.util.concatenate(sphere_batches)
-
-        t1 = time.time()
-        emit(f"  Sphere mesh built: {len(tool_mesh.vertices)} vertices, "
-             f"{len(tool_mesh.faces)} triangles ({t1-t0:.1f}s)")
-
-        # Use manifold3d directly for maximum control
+        # Convert part mesh to manifold
         emit("  Converting to Manifold objects...")
         try:
             part_manifold = self._trimesh_to_manifold(part_mesh, Manifold, ManifoldMesh)
@@ -578,7 +546,7 @@ class ManifoldStippleProcessor:
         emit("  Building sphere manifolds and unioning...")
         t_union_start = time.time()
         sphere_manifolds = []
-        for i, (centre, radius) in enumerate(sphere_specs):
+        for centre, radius in sphere_specs:
             m = Manifold.sphere(radius, circular_segments=16)
             m = m.translate([centre[0], centre[1], centre[2]])
             sphere_manifolds.append(m)

@@ -50,8 +50,7 @@ def main():
 
     args = parser.parse_args()
 
-    processor = ManifoldStippleProcessor()
-    processor.random_seed = args.seed
+    processor = ManifoldStippleProcessor(random_seed=args.seed)
     result = processor.process(
         step_file=args.input,
         output_path=args.output,

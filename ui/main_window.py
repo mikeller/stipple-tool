@@ -60,12 +60,15 @@ class ProcessingThread(QThread):
         try:
             from core.manifold_stipple_processor import ManifoldStippleProcessor
 
+            class _CancelledError(Exception):
+                pass
+
             self.progress.emit(10)
             self.status.emit("Starting manifold stippling...")
 
             def on_status(msg: str):
                 if self._cancelled:
-                    raise RuntimeError("Processing cancelled by user")
+                    raise _CancelledError()
                 self.status.emit(msg)
 
             processor = ManifoldStippleProcessor()
@@ -86,8 +89,10 @@ class ProcessingThread(QThread):
             else:
                 self.finished.emit(False, "Stippling failed - no output generated")
 
+        except _CancelledError:
+            self.finished.emit(False, "__cancelled__")
         except Exception as e:
-            error_msg = f"Error during processing: {str(e)}\n{traceback.format_exc()}"
+            error_msg = f"Error during processing: {e!s}\n{traceback.format_exc()}"
             self.finished.emit(False, error_msg)
 
 
@@ -227,10 +232,9 @@ class MainWindow(QMainWindow):
         self.preview_text.setReadOnly(True)
         self.preview_text.setPlainText(
             "Stipple Preview:\n\n"
-            "Size: Diameter of each stipple indentation\n"
+            "Size: Radius of each spherical indentation\n"
             "Depth: How deep the indentations will be\n"
-            "Density: How many stipples per unit area\n"
-            "Pattern: Distribution pattern of stipples\n\n"
+            "Density: How many stipples per unit area\n\n"
             "Current settings will be applied to selected surfaces."
         )
         preview_layout.addWidget(self.preview_text)
@@ -333,7 +337,7 @@ class MainWindow(QMainWindow):
                 <li>Detect surface colors</li>
                 <li>Apply stippling textures to selected surfaces</li>
                 <li>Customize stipple parameters</li>
-                <li>Export modified models to STEP format</li>
+                <li>Export modified models as mesh (STL/3MF/OBJ)</li>
             </ul>
             <h3>Workflow:</h3>
             <ol>
@@ -509,6 +513,11 @@ class MainWindow(QMainWindow):
     
     def on_processing_finished(self, success: bool, message: str):
         """Handle processing completion."""
+        if not success and message == "__cancelled__":
+            self.progress_bar.setValue(0)
+            self.status_label.setText("Cancelled")
+            return
+
         self.progress_bar.setValue(100 if success else 0)
         
         if success:
