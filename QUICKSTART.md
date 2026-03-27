@@ -13,11 +13,6 @@
    pip install -r requirements.txt
    ```
 
-3. Verify installation:
-   ```bash
-   python3 scripts/test_installation.py
-   ```
-
 ## Usage - GUI Mode
 
 ```bash
@@ -27,75 +22,62 @@ python main.py
 This opens an interactive interface where you can:
 - Load STEP files (.step or .stp)
 - View and select surface colors
-- Configure stippling parameters (size, depth, density, pattern)
+- Configure stippling parameters (sphere radius, depth, density)
 - Apply stippling to selected surfaces
-- Export as a new STEP file
+- Export as STL, 3MF, or OBJ
 
-## Usage - Programmatic
+## Usage - CLI
 
 ```bash
-python demo.py
+python stipple_tool_cli.py model.step -o output.stl -c "#360200"
 ```
 
-Example code:
-```python
-from core.step_loader import STEPLoader
-from core.color_analyzer import ColorAnalyzer
-from core.stipple_engine import StippleEngine
-
-loader = STEPLoader()
-loader.load("model.step")
-
-analyzer = ColorAnalyzer()
-model_data = loader.get_model()
-colors = analyzer.detect_distinct_colors(model_data)
-
-engine = StippleEngine()
-engine.set_parameters(size=1.0, depth=0.5, density=0.3)
-
-faces = model_data["faces"]
-modified = engine.apply_stippling_to_shape(
-    model_data["shape"], faces, pattern="random"
-)
-
-loader.save_step("output.step", modified)
+Parameters:
+```bash
+python stipple_tool_cli.py model.step \
+  -o output.stl \
+  -c "#360200" \
+  --radius 1.4 \
+  --depth 0.6 \
+  --spheres-per-mm2 0.5
 ```
+
+Run `python stipple_tool_cli.py --help` for all options.
 
 ## File Structure
 
-```
+```text
 main.py              - Launch GUI application
-demo.py              - Programmatic example
-test_installation.py - Verify dependencies
+stipple_tool_cli.py  - Command-line interface
 
 core/
-  step_loader.py     - STEP file I/O (OCP-based)
-  color_analyzer.py  - Surface color detection
-  stipple_engine.py  - Stippling algorithm
+  step_loader.py               - STEP file I/O (OCP-based)
+  color_analyzer.py            - Surface color detection
+  step_mesh_converter.py       - STEP → trimesh conversion
+  manifold_stipple_processor.py - Stippling pipeline (manifold3d booleans)
 
 ui/
   main_window.py     - GUI implementation (PyQt6)
 
 requirements.txt     - Dependencies
 README.md            - Full documentation
-INSTALLATION.md      - Setup guide
 ```
 
 ## Features
 
-✓ Load and parse STEP files  
-✓ Detect and analyze surface colors  
-✓ Apply customizable stippling patterns  
-✓ Export modified models to STEP format  
-✓ Interactive GUI with real-time preview  
-✓ Batch processing support  
+✓ Load and parse STEP files
+✓ Detect and analyze surface colors
+✓ Sphere-based stippling with manifold3d boolean operations
+✓ Curvature-compensated depth for uniform indentations
+✓ Size variation (Gaussian or uniform)
+✓ Export to STL, 3MF, or OBJ mesh formats
+✓ Interactive GUI with progress reporting
 
 ## Stippling Parameters
 
-- **Size**: Diameter of each indentation (mm)
-- **Depth**: How deep the indentations go (mm)
-- **Density**: Number of stipples per unit area (0-1)
-- **Pattern**: random, grid, or hexagonal distribution
+- **Sphere Radius**: Radius of each spherical indentation (mm)
+- **Depth**: How deep the sphere cap cuts into the surface (mm)
+- **Spheres per mm²**: Target density of stipples on the surface
 
 ## Typical Workflow
 
@@ -103,20 +85,19 @@ INSTALLATION.md      - Setup guide
 2. Click "Load STEP File" and select your model
 3. Click "Analyze Colors" to detect colored surfaces
 4. Select the color you want to stipple
-5. Adjust stippling parameters in the Stipple tab
-6. Click "Browse..." to select output file
+5. Adjust stippling parameters
+6. Click "Browse..." to select output file (STL/3MF/OBJ)
 7. Click "Apply Stippling & Export" to process
 
 ## Output
 
-A new STEP file with stippling applied to the selected colored surfaces. Ready for 3D printing!
+A mesh file (STL/3MF/OBJ) with stippling applied to the selected colored surfaces. Ready for 3D printing!
 
 ## Notes
 
-- Processing time depends on model complexity
-- Stippling creates hemispheric indentations
+- Processing time depends on model complexity and sphere count
+- Stippling creates spherical indentations using manifold3d boolean operations
 - Adds gripping texture suitable for handles
 - Maintains overall model geometry
-- Backward compatible with STEP standard
 
-For more information, see [README.md](README.md) and INSTALLATION.md
+For more information, see [README.md](README.md)

@@ -19,9 +19,6 @@ from PyQt6.QtGui import QFont, QColor
 
 from core.step_loader import STEPLoader
 from core.color_analyzer import ColorAnalyzer
-from core.stencil_processor import StencilStippleProcessor
-from core.mesh_loader import MeshLoader
-from core.mesh_color_analyzer import MeshColorAnalyzer
 
 
 class ProcessingThread(QThread):
@@ -34,27 +31,19 @@ class ProcessingThread(QThread):
 
     def __init__(
         self,
-        model_loader,
-        color_analyzer,
         selected_color,
         output_path,
-        pattern,
-        model_type,
         current_file,
-        size,
+        radius,
         depth,
-        density,
+        spheres_per_mm2,
     ):
         super().__init__()
-        self.model_loader = model_loader
-        self.color_analyzer = color_analyzer
         self.selected_color = selected_color
-        self.size = size
+        self.radius = radius
         self.depth = depth
-        self.density = density
+        self.spheres_per_mm2 = spheres_per_mm2
         self.output_path = output_path
-        self.pattern = pattern
-        self.model_type = model_type
         self.current_file = current_file
         self._cancelled = False
 
@@ -69,110 +58,42 @@ class ProcessingThread(QThread):
     def run(self):
         """Execute the stippling process."""
         try:
+            from core.manifold_stipple_processor import ManifoldStippleProcessor
+
+            class _CancelledError(Exception):
+                pass
+
             self.progress.emit(10)
+            self.status.emit("Starting manifold stippling...")
 
-            model_data = self.model_loader.get_model()
-            if model_data is None:
-                self.finished.emit(False, "Model not loaded")
-                return
-
-            self.progress.emit(20)
-
-            face_indices = self.color_analyzer.get_faces_by_color(self.selected_color)
-            if not face_indices:
-                self.finished.emit(False, f"No faces found with color: {self.selected_color}")
-                return
-
-            self.progress.emit(40)
-            self.status.emit("Stippling in progress...")
-
-            if self.model_type == "mesh":
-                self.finished.emit(False, "Mesh input is no longer supported. Please use a STEP file.")
-                return
-
-            if self.model_type == "step":
-                self._run_step_stippling(model_data, face_indices)
-                return
-
-            self.finished.emit(False, f"Unknown model type: {self.model_type}")
-
-        except Exception as e:
-            error_msg = f"Error during processing: {str(e)}\n{traceback.format_exc()}"
-            self.finished.emit(False, error_msg)
-
-    def _run_step_stippling(self, model_data, face_indices):
-        """Apply stippling to STEP model using stencil-based approach."""
-        try:
-            self.progress.emit(20)
-            self.status.emit("Starting stencil stippling...")
-            
-            # Create processor
-            processor = StencilStippleProcessor()
-            
-            # Use parameters passed from main window
-            sphere_radius = self.size  # In mm
-            sphere_depth = self.depth  # In mm
-            density = self.density  # 0.0-1.0
-            
-            # Convert density to spheres_per_mm2
-            # Density 0.8 should map to roughly 0.15 spheres/mm2 for good coverage
-            # Scale: 0.0 → 0.0, 0.5 → 0.1, 0.8 → 0.15, 1.0 → 0.2
-            spheres_per_mm2 = density * 0.2
-            
-            # Stencil approach parameters
-            strip_count = 8  # Number of strips to divide geometry
-            overlap = 0.3  # 30% overlap between strips
-            batch_size = 2  # Small batches to avoid geometry fragmentation
-            
             def on_status(msg: str):
-                if self.is_cancelled():
-                    raise RuntimeError("Processing cancelled by user")
+                if self._cancelled:
+                    raise _CancelledError()
                 self.status.emit(msg)
-                # Simulate progress updates based on status messages
-                if "strip" in msg.lower():
-                    # Extract strip number if possible and update progress
-                    import re
-                    match = re.search(r'(\d+)/(\d+)', msg)
-                    if match:
-                        curr, total = int(match.group(1)), int(match.group(2))
-                        self.progress.emit(int(20 + (curr / total) * 70))
 
-            def on_cancel_check():
-                if self.is_cancelled():
-                    raise RuntimeError("Processing cancelled by user")
-
-            result_path = processor.process_step_with_stencil_stippling(
+            processor = ManifoldStippleProcessor()
+            result = processor.process(
                 step_file=self.current_file,
                 output_path=self.output_path,
                 target_color=self.selected_color,
-                sphere_radius=sphere_radius,
-                sphere_depth=sphere_depth,
-                spheres_per_mm2=spheres_per_mm2,
-                strip_count=strip_count,
-                overlap=overlap,
-                batch_size=batch_size,
-                size_variation=True,  # Add variety in hole sizes (0.5x to 1.5x radius)
+                sphere_radius=self.radius,
+                sphere_depth=self.depth,
+                spheres_per_mm2=self.spheres_per_mm2,
                 status_callback=on_status,
-                cancel_callback=on_cancel_check,
             )
-            
-            self.progress.emit(95)
-            
-            if result_path and Path(result_path).exists():
+
+            if result and Path(result).exists():
                 self.progress.emit(100)
-                self.finished.emit(True, f"Successfully saved to: {result_path}")
+                self.finished.emit(True, f"Successfully saved to: {result}")
                 self.status.emit("Done")
             else:
-                self.finished.emit(False, "Incremental stippling failed - no output generated")
+                self.finished.emit(False, "Stippling failed - no output generated")
 
+        except _CancelledError:
+            self.finished.emit(False, "__cancelled__")
         except Exception as e:
-            error_msg = f"Error in STEP stippling: {str(e)}\n{traceback.format_exc()}"
+            error_msg = f"Error during processing: {e!s}\n{traceback.format_exc()}"
             self.finished.emit(False, error_msg)
-
-    def _run_mesh_stippling(self, model_data, face_indices):
-        """Run stippling on mesh models and export as OBJ/STL."""
-        self.finished.emit(False, "Mesh input is no longer supported. Please use a STEP file.")
-        return
 
 
 class MainWindow(QMainWindow):
@@ -185,12 +106,6 @@ class MainWindow(QMainWindow):
 
         self.step_loader = STEPLoader()
         self.color_analyzer = ColorAnalyzer()
-        self.mesh_loader = MeshLoader()
-        self.mesh_color_analyzer = MeshColorAnalyzer()
-
-        self.active_loader = self.step_loader
-        self.active_color_analyzer = self.color_analyzer
-        self.model_type = "step"
 
         self.current_file = None
         self.output_path = None
@@ -279,38 +194,33 @@ class MainWindow(QMainWindow):
         config_group = QGroupBox("Stipple Parameters")
         config_layout = QFormLayout()
         
-        # Stipple size
+        # Stipple size (radius)
         self.size_spin = QDoubleSpinBox()
         self.size_spin.setMinimum(0.1)
         self.size_spin.setMaximum(10.0)
-        self.size_spin.setValue(1.0)
+        self.size_spin.setValue(1.4)
         self.size_spin.setSuffix(" mm")
         self.size_spin.setSingleStep(0.1)
-        config_layout.addRow("Stipple Size:", self.size_spin)
+        config_layout.addRow("Sphere Radius:", self.size_spin)
         
         # Stipple depth
         self.depth_spin = QDoubleSpinBox()
         self.depth_spin.setMinimum(0.05)
         self.depth_spin.setMaximum(5.0)
-        self.depth_spin.setValue(0.5)
+        self.depth_spin.setValue(0.6)
         self.depth_spin.setSuffix(" mm")
         self.depth_spin.setSingleStep(0.05)
-        config_layout.addRow("Stipple Depth:", self.depth_spin)
+        config_layout.addRow("Cut Depth:", self.depth_spin)
         
-        # Stipple density
+        # Stipple density (spheres per mm²)
         self.density_spin = QDoubleSpinBox()
         self.density_spin.setMinimum(0.01)
-        self.density_spin.setMaximum(1.0)
-        self.density_spin.setValue(0.8)
+        self.density_spin.setMaximum(5.0)
+        self.density_spin.setValue(0.5)
+        self.density_spin.setDecimals(2)
+        self.density_spin.setSuffix(" /mm²")
         self.density_spin.setSingleStep(0.05)
-        config_layout.addRow("Stipple Density:", self.density_spin)
-        
-        # Pattern type
-        self.pattern_combo = QComboBox()
-        self.pattern_combo.addItems(["random", "grid", "hexagon"])
-        self.pattern_combo.setCurrentText("hexagon")
-        config_layout.addRow("Pattern Type:", self.pattern_combo)
-        
+        config_layout.addRow("Density:", self.density_spin)
         config_group.setLayout(config_layout)
         layout.addWidget(config_group)
         
@@ -322,10 +232,9 @@ class MainWindow(QMainWindow):
         self.preview_text.setReadOnly(True)
         self.preview_text.setPlainText(
             "Stipple Preview:\n\n"
-            "Size: Diameter of each stipple indentation\n"
+            "Size: Radius of each spherical indentation\n"
             "Depth: How deep the indentations will be\n"
-            "Density: How many stipples per unit area\n"
-            "Pattern: Distribution pattern of stipples\n\n"
+            "Density: How many stipples per unit area\n\n"
             "Current settings will be applied to selected surfaces."
         )
         preview_layout.addWidget(self.preview_text)
@@ -428,7 +337,7 @@ class MainWindow(QMainWindow):
                 <li>Detect surface colors</li>
                 <li>Apply stippling textures to selected surfaces</li>
                 <li>Customize stipple parameters</li>
-                <li>Export modified models to STEP format</li>
+                <li>Export modified models as mesh (STL/3MF/OBJ)</li>
             </ul>
             <h3>Workflow:</h3>
             <ol>
@@ -454,37 +363,30 @@ class MainWindow(QMainWindow):
         return widget
     
     def load_file(self):
-        """Load a STEP file (only format with reliable color detection)."""
+        """Load a STEP file."""
         file_path, _ = QFileDialog.getOpenFileName(
             self, 
-            "Open Model File",
+            "Open STEP File",
             "",
             "STEP Files (*.step *.stp);;All Files (*)"
         )
         
         if file_path:
             ext = Path(file_path).suffix.lower()
-            if ext in [".step", ".stp"]:
-                loader = self.step_loader
-                analyzer = self.color_analyzer
-                self.model_type = "step"
-            else:
-                # Mesh formats (currently not supported for color detection)
-                QMessageBox.warning(self, "Warning", "Only STEP files support multi-color detection. Please use a STEP file.")
+            if ext not in [".step", ".stp"]:
+                QMessageBox.warning(self, "Warning", "Only STEP files are supported. Please use a STEP file.")
                 return
 
-            if loader.load(file_path):
+            if self.step_loader.load(file_path):
                 self.current_file = file_path
                 self.file_label.setText(f"Loaded: {Path(file_path).name}")
-                self.active_loader = loader
-                self.active_color_analyzer = analyzer
                 self.analyze_colors()
             else:
                 QMessageBox.critical(self, "Error", "Failed to load model")
     
     def analyze_colors(self):
         """Analyze colors in the loaded model."""
-        if self.active_loader.get_model() is None:
+        if self.step_loader.get_model() is None:
             QMessageBox.warning(self, "Warning", "Please load a model file first")
             return
         
@@ -492,8 +394,8 @@ class MainWindow(QMainWindow):
             self.color_list.clear()
             self.target_color_combo.clear()
 
-            model_data = self.active_loader.get_model()
-            color_groups = self.active_color_analyzer.extract_colors_from_model(model_data)
+            model_data = self.step_loader.get_model()
+            color_groups = self.color_analyzer.extract_colors_from_model(model_data)
             colors = list(color_groups.keys())
 
             if not colors:
@@ -522,9 +424,6 @@ class MainWindow(QMainWindow):
             color_count = len(colors)
             status_msg = f"Found {color_count} color(s)"
             
-            if color_count == 1 and self.model_type == "mesh":
-                status_msg += " (only 1 color - check if a STEP file exists with more colors)"
-            
             self.status_label.setText(status_msg)
             
         except Exception as e:
@@ -550,25 +449,23 @@ class MainWindow(QMainWindow):
 
     def browse_output(self):
         """Browse for output file path."""
-        filter_str = "STEP Files (*.step)"
-
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Stippled Model As",
             "",
-            filter_str,
+            "STL Files (*.stl);;3MF Files (*.3mf);;OBJ Files (*.obj)",
         )
         
         if file_path:
             out_path = Path(file_path)
-            if out_path.suffix.lower() != ".step":
-                out_path = out_path.with_suffix(".step")
+            if out_path.suffix.lower() not in {".stl", ".3mf", ".obj"}:
+                out_path = out_path.with_suffix(".stl")
             self.output_path = str(out_path)
             self.output_path_label.setText(f"Output: {out_path.name}")
     
     def process_model(self):
         """Process the model with stippling."""
-        if self.active_loader.get_model() is None:
+        if self.step_loader.get_model() is None:
             QMessageBox.warning(self, "Warning", "Please load a model file first")
             return
         
@@ -576,26 +473,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please select an output file")
             return
         
-        # STEP-only output
-        if self.output_path:
-            out_path = Path(self.output_path)
-            if out_path.suffix.lower() != ".step":
-                self.output_path = str(out_path.with_suffix(".step"))
-                self.output_path_label.setText(f"Output: {Path(self.output_path).name}")
-        
         # Start processing thread
         selected_color = self.target_color_combo.currentData()
         if not selected_color:
             selected_color = self.target_color_combo.currentText()
-        pattern = self.pattern_combo.currentText()
         
         self.processing_thread = ProcessingThread(
-            self.active_loader,
-            self.active_color_analyzer,
             selected_color,
             self.output_path,
-            pattern,
-            self.model_type,
             self.current_file,
             self.size_spin.value(),
             self.depth_spin.value(),
@@ -628,6 +513,11 @@ class MainWindow(QMainWindow):
     
     def on_processing_finished(self, success: bool, message: str):
         """Handle processing completion."""
+        if not success and message == "__cancelled__":
+            self.progress_bar.setValue(0)
+            self.status_label.setText("Cancelled")
+            return
+
         self.progress_bar.setValue(100 if success else 0)
         
         if success:

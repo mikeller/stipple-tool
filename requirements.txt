@@ -5,3 +5,5 @@ PyQt6-Qt6==6.9.1
 PyQt6_sip==13.10.2
 trimesh==4.4.1
 scipy==1.13.1
+manifold3d>=3.0.0
+pymeshfix>=0.17.0
